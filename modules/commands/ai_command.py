@@ -177,9 +177,7 @@ class AiCommand(BaseCommand):
             client = self._get_gemini_client()
 
             # Run the synchronous API call in a thread pool to avoid blocking
-            # Increase max_output_tokens to ~200 to allow for complete sentences
-            # We'll truncate to 128 chars after if needed
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
                 lambda: client.models.generate_content(
@@ -187,7 +185,7 @@ class AiCommand(BaseCommand):
                     contents=user_prompt,
                     config={
                         'system_instruction': system_prompt,
-                        'max_output_tokens': 1000,  # Increased to allow complete sentences
+                        'max_output_tokens': 1000,
                         'temperature': 0.7,  # Balanced creativity
                     }
                 )
