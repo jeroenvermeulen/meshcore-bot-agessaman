@@ -176,19 +176,15 @@ class AiCommand(BaseCommand):
             # Get Gemini client
             client = self._get_gemini_client()
 
-            # Run the synchronous API call in a thread pool to avoid blocking
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=user_prompt,
-                    config={
-                        'system_instruction': system_prompt,
-                        'max_output_tokens': 1000,
-                        'temperature': 0.7,  # Balanced creativity
-                    }
-                )
+            # Call Gemini API (simplified - no executor needed)
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=user_prompt,
+                config={
+                    'system_instruction': system_prompt,
+                    'max_output_tokens': 200,
+                    'temperature': 0.7,
+                }
             )
 
             # Extract text from response
