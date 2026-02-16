@@ -387,6 +387,11 @@ airnow_api_key =
 # Paid tier (14 EUR/year): 3-6 day forecast, 15-30 minute resolution
 forecast_solar_api_key = 
 
+# Google Gemini API key for AI command
+# Get free key at: https://aistudio.google.com/apikey
+# Used by the 'ai' command to provide AI-powered responses
+gemini_api_key =
+
 # Repeater prefix API URL for prefix command
 # Leave empty to disable prefix command functionality
 # Configure your own regional API endpoint
@@ -632,6 +637,18 @@ enable_p_shortcut = false
 # true: Hacker command is available (responds to Linux commands with supervillain mainframe errors)
 # false: Hacker command is disabled
 hacker_enabled = false
+
+[Ai_Command]
+# Enable or disable the AI command
+# true: AI command is available (users can ask questions to Gemini AI)
+# false: AI command is disabled
+enabled = true
+
+# Channels where AI command is allowed
+# IMPORTANT: Leave commented out (or omit entirely) to use global monitor_channels (default behavior)
+# If uncommented with empty value (channels = ), command will be DM-only
+# If uncommented with channel list (channels = general,tech), command will only work in those channels
+# channels =
 
 [Multitest_Command]
 # Response format for multitest command results

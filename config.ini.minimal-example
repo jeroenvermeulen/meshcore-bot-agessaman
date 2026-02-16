@@ -380,6 +380,10 @@ stats_enabled = false
 # Enable or disable the hacker command
 hacker_enabled = false
 
+[Ai_Command]
+# Enable or disable the AI command
+enabled = false
+
 [Greeter_Command]
 # Enable or disable the greeter command
 enabled = false
