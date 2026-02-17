@@ -84,8 +84,14 @@ class AiCommand(BaseCommand):
         if self._client is None:
             try:
                 from google import genai
-                self._client = genai.Client(api_key=self.gemini_api_key)
-                self.logger.info("Gemini client initialized successfully")
+                from google.genai.types import HttpOptions
+                self._client = genai.Client(
+                    api_key=self.gemini_api_key,
+                    http_options=HttpOptions(
+                        timeout=self.TIMEOUT * 1000  # 15 seconds = 15000 milliseconds
+                    )
+                )
+                self.logger.info("Gemini client initialized successfully with timeout")
             except ImportError:
                 self.logger.error("google-genai package not installed. Install with: pip install google-genai")
                 raise
@@ -186,8 +192,8 @@ class AiCommand(BaseCommand):
                         contents=user_prompt,
                         config={
                             'system_instruction': system_prompt,
-                            'max_output_tokens': 200,
-                            'temperature': 0.7,
+                            'max_output_tokens': 1000,
+                            'temperature': 0.7, # Balanced creativity
                         }
                     )
                 ),
