@@ -53,26 +53,30 @@ class AiCommand(BaseCommand):
     
     def can_execute(self, message: MeshMessage) -> bool:
         """Check if this command can be executed.
-        
+
         Args:
             message: The message triggering the command.
-            
+
         Returns:
             bool: True if command can execute, False otherwise.
         """
         # Use base class for channel access, DM requirements, and cooldown
         if not super().can_execute(message):
+            # Log why the command can't execute for debugging
+            channel_info = f"channel '{message.channel}'" if not message.is_dm else "DM"
+            self.logger.debug(f"AI command can't execute in {channel_info} - failed base checks (channel access, DM requirements, or cooldown)")
             return False
-        
+
         # Check if AI command is enabled
         if not self.ai_enabled:
+            self.logger.debug("AI command is disabled in config")
             return False
-        
+
         # Check if API key is configured
         if not self.gemini_api_key:
             self.logger.warning("Gemini API key not configured")
             return False
-        
+
         return True
     
     def _get_gemini_client(self):
