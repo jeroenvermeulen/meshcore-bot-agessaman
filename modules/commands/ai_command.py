@@ -23,23 +23,40 @@ class AiCommand(BaseCommand):
     requires_internet = True  # Requires internet access for Gemini API
     
     # Constants
-    MAX_QUESTION_LENGTH = 125 # 128 - 'ai ' prefix
     MAX_RESPONSE_LENGTH = 128
     TIMEOUT = 15  # seconds
     
     def __init__(self, bot):
         """Initialize the AI command.
-        
+
         Args:
             bot: The bot instance.
         """
         super().__init__(bot)
-        
+
         # Load configuration
         self.ai_enabled = self.get_config_value('Ai_Command', 'enabled', fallback=True, value_type='bool')
         self.gemini_api_key = bot.config.get('External_Data', 'gemini_api_key', fallback='')
+        self.gemini_model = self.get_config_value('Ai_Command', 'gemini_model', fallback='gemini-2.5-flash', value_type='str')
         self.bot_name = bot.config.get('Bot', 'bot_name', fallback='MeshCore-Bot')
-        
+
+        # Load system prompt template (with default fallback)
+        default_system_prompt = (
+            'You are a bot on MeshCore named "{bot_name}" which is publicly available. '
+            'CRITICAL: Your answer MUST be maximum {max_length} characters total. '
+            'Keep responses concise and complete sentences within {max_length} characters. '
+            'Your answer is the end of the conversation, the user can\'t respond to your answer.'
+        )
+        self.system_prompt_template = self.get_config_value(
+            'Ai_Command', 'system_prompt',
+            fallback=default_system_prompt,
+            value_type='str'
+        )
+
+        # Load AI generation parameters
+        self.max_output_tokens = self.get_config_value('Ai_Command', 'max_output_tokens', fallback=1000, value_type='int')
+        self.temperature = self.get_config_value('Ai_Command', 'temperature', fallback=0.7, value_type='float')
+
         # Initialize Gemini client (lazy loading)
         self._client = None
     
@@ -49,7 +66,7 @@ class AiCommand(BaseCommand):
         Returns:
             str: The help text for this command.
         """
-        return f"Usage: ai <question> - Ask a question to Gemini AI (max {self.MAX_QUESTION_LENGTH} chars)"
+        return f"Usage: ai <question> - Ask a question to Gemini AI"
     
     def can_execute(self, message: MeshMessage) -> bool:
         """Check if this command can be executed.
@@ -122,16 +139,11 @@ class AiCommand(BaseCommand):
         # Parse the command to extract question
         parts = content.split(maxsplit=1)
         if len(parts) < 2:
-            await self.send_response(message, f"Usage: ai <question> (max {self.MAX_QUESTION_LENGTH} chars)")
+            await self.send_response(message, f"Usage: ai <question>")
             return True
         
         question = parts[1].strip()
-        
-        # Validate question length
-        if len(question) > self.MAX_QUESTION_LENGTH:
-            await self.send_response(message, f"Question too long! Max {self.MAX_QUESTION_LENGTH} chars.")
-            return True
-        
+
         if len(question) == 0:
             await self.send_response(message, "Please provide a question.")
             return True
@@ -168,13 +180,10 @@ class AiCommand(BaseCommand):
             Optional[str]: The AI response, or None if it fails.
         """
         try:
-            # Build the system prompt with stronger emphasis on character limit
-            system_prompt = (
-                f'You are a bot on MeshCore named "{self.bot_name}" which is publicly available. '
-                f'Anyone can ask you a question of maximum {self.MAX_QUESTION_LENGTH} characters. '
-                f'CRITICAL: Your answer MUST be maximum {self.MAX_RESPONSE_LENGTH} characters total. '
-                f'Keep responses concise and complete sentences within {self.MAX_RESPONSE_LENGTH} characters. '
-                f'Your answer is the end of the conversation, the user can\'t respond to your answer.'
+            # Build the system prompt from template with placeholder substitution
+            system_prompt = self.system_prompt_template.format(
+                bot_name=self.bot_name,
+                max_length=self.MAX_RESPONSE_LENGTH
             )
 
             # Build the user prompt
@@ -192,12 +201,12 @@ class AiCommand(BaseCommand):
                 loop.run_in_executor(
                     None,
                     lambda: client.models.generate_content(
-                        model='gemini-2.5-flash',
+                        model=self.gemini_model,
                         contents=user_prompt,
                         config={
                             'system_instruction': system_prompt,
-                            'max_output_tokens': 1000,
-                            'temperature': 0.7, # Balanced creativity
+                            'max_output_tokens': self.max_output_tokens,
+                            'temperature': self.temperature,
                         }
                     )
                 ),

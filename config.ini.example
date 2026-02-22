@@ -872,6 +872,28 @@ enabled = false
 # false: AI command is disabled
 enabled = true
 
+# Gemini model to use for AI responses
+# Available models: gemini-2.5-flash, gemini-2.0-flash, gemini-1.5-flash, gemini-1.5-pro
+# See https://ai.google.dev/gemini-api/docs/models for available models
+gemini_model = gemini-2.5-flash
+
+# System prompt for AI responses
+# Available placeholders:
+# {bot_name} - The bot's name from [Bot] section
+# {max_length} - Maximum response length (128 characters)
+# Leave empty to use default prompt
+system_prompt = You are a bot on MeshCore named "{bot_name}" which is publicly available. CRITICAL: Your answer MUST be maximum {max_length} characters total. Keep responses concise and complete sentences within {max_length} characters. Your answer is the end of the conversation, the user can't respond to your answer.
+
+# Maximum output tokens for AI responses
+max_output_tokens = 1000
+
+# Temperature for AI responses
+# Controls randomness/creativity of responses (0.0 to 2.0)
+# 0.0 = Deterministic, focused responses
+# 0.7 = Balanced creativity (default)
+# 1.0+ = More creative, varied responses
+temperature = 0.7
+
 # Channels where AI command is allowed
 # IMPORTANT: Leave commented out (or omit entirely) to use global monitor_channels (default behavior)
 # If uncommented with empty value (channels = ), command will be DM-only
