@@ -56,6 +56,9 @@ nav:
     - Service: service-installation.md
   - Configuration:
     - Overview: configuration.md
+    - Data retention: data-retention.md
+    - Local plugins and services: local-plugins.md
+    - Check-in API: checkin-api.md
     - Path Command: path-command-config.md
     - Config validation: config-validation.md
   - Web Viewer: web-viewer.md

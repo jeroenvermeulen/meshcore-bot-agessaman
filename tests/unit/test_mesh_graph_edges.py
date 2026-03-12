@@ -171,3 +171,82 @@ class TestMeshGraphEdges:
         edge = mesh_graph.get_edge('01', '7e')
         assert edge['last_seen'] > first_time
         assert edge['first_seen'] == first_time  # First seen shouldn't change
+
+
+@pytest.mark.unit
+class TestMeshGraphMultiByteMerge:
+    """Test MeshGraph 1-byte uniqueness merge and 2/3-byte merge/promote (multi-byte node identity)."""
+
+    def test_one_byte_merge_when_unique(self, mesh_graph):
+        """1-byte observation merges into the single matching 2-byte edge (unique link)."""
+        mesh_graph.add_edge('0c01', '0d42')  # 2-byte edge first
+        assert len(mesh_graph.edges) == 1
+        mesh_graph.add_edge('0c', '0d')  # 1-byte: only one match -> merge
+        assert len(mesh_graph.edges) == 1
+        edge = mesh_graph.get_edge('0c', '0d')
+        assert edge is not None
+        assert edge['from_prefix'] == '0c01'
+        assert edge['to_prefix'] == '0d42'
+        assert edge['observation_count'] == 2
+
+    def test_one_byte_no_merge_when_multiple(self, mesh_graph):
+        """1-byte observation does not merge when multiple edges prefix-match (ambiguous)."""
+        mesh_graph.add_edge('0c01', '0d42')
+        mesh_graph.add_edge('0c99', '0dee')
+        assert len(mesh_graph.edges) == 2
+        mesh_graph.add_edge('0c', '0d')  # 1-byte: two matches -> create separate 1-byte edge
+        assert len(mesh_graph.edges) == 3
+        # The 1-byte edge (0c, 0d) should exist with count 1
+        one_byte_edge = mesh_graph.edges.get(('0c', '0d'))
+        assert one_byte_edge is not None
+        assert one_byte_edge['observation_count'] == 1
+        # 2-byte edges unchanged
+        assert mesh_graph.get_edge('0c01', '0d42')['observation_count'] == 1
+        assert mesh_graph.get_edge('0c99', '0dee')['observation_count'] == 1
+
+    def test_two_byte_merges_into_three_byte(self, mesh_graph):
+        """2-byte observation merges into existing 3-byte edge (more specific)."""
+        mesh_graph.add_edge('0101c1', '8611ab')  # 3-byte; to_prefix must start with 8611 for prefix_match
+        mesh_graph.add_edge('0101', '8611')  # 2-byte: best match is 3-byte -> update that
+        assert len(mesh_graph.edges) == 1
+        edge = mesh_graph.get_edge('0101', '8611')
+        assert edge['from_prefix'] == '0101c1'
+        assert edge['to_prefix'] == '8611ab'
+        assert edge['observation_count'] == 2
+
+    def test_promote_one_byte_to_three_byte(self, mesh_graph):
+        """When 3-byte observation follows 1-byte and 1-byte has no public_key, do NOT promote: keep 1-byte edge and merge count (preserves other e0 nodes)."""
+        mesh_graph.add_edge('01', '86')  # 1-byte, no public_key
+        assert len(mesh_graph.edges) == 1
+        assert ('01', '86') in mesh_graph.edges
+        mesh_graph.add_edge('0101c1', '86ab12')  # 3-byte: would promote, but 1-byte has no public_key -> merge into 1-byte
+        assert len(mesh_graph.edges) == 1
+        assert ('01', '86') in mesh_graph.edges
+        edge = mesh_graph.get_edge('01', '86')
+        assert edge is not None
+        assert edge['from_prefix'] == '01'
+        assert edge['to_prefix'] == '86'
+        assert edge['observation_count'] == 2
+
+    def test_promote_one_byte_to_three_byte_when_1byte_has_public_key(self, mesh_graph):
+        """When 3-byte observation follows 1-byte and 1-byte edge has public_key, promote: remove 1-byte, add 3-byte with merged count."""
+        mesh_graph.add_edge('01', '86', from_public_key='01' * 32, to_public_key='86' * 32)  # 1-byte with keys
+        assert len(mesh_graph.edges) == 1
+        assert ('01', '86') in mesh_graph.edges
+        mesh_graph.add_edge('0101c1', '86ab12')  # 3-byte: best match has public_key -> promote
+        assert len(mesh_graph.edges) == 1
+        assert ('01', '86') not in mesh_graph.edges
+        edge = mesh_graph.get_edge('01', '86')
+        assert edge is not None
+        assert edge['from_prefix'] == '0101c1'
+        assert edge['to_prefix'] == '86ab12'
+        assert edge['observation_count'] == 2
+
+    def test_get_edge_returns_three_byte_when_present(self, mesh_graph):
+        """get_edge(01, 86) returns the 3-byte edge when it exists (prefix match prefers best)."""
+        mesh_graph.add_edge('0101c1', '86ab12')
+        edge = mesh_graph.get_edge('01', '86')
+        assert edge is not None
+        assert edge['from_prefix'] == '0101c1'
+        assert edge['to_prefix'] == '86ab12'
+        assert edge['observation_count'] == 1

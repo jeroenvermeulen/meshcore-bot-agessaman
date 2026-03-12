@@ -6,7 +6,9 @@ Handles scanning, loading, and registering service plugins
 
 import os
 import sys
+import types
 import importlib
+import importlib.util
 import inspect
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Type
@@ -17,12 +19,21 @@ from .service_plugins.base_service import BaseServicePlugin
 class ServicePluginLoader:
     """Handles dynamic loading and discovery of service plugins"""
     
-    def __init__(self, bot, services_dir: str = None):
+    def __init__(self, bot, services_dir: str = None, local_services_dir: Optional[str] = None):
         self.bot = bot
         self.logger = bot.logger
         self.services_dir = services_dir or os.path.join(
             os.path.dirname(__file__), 'service_plugins'
         )
+        if local_services_dir is not None:
+            self.local_services_dir = local_services_dir
+        else:
+            bot_root = getattr(bot, 'bot_root', None)
+            if bot_root is not None:
+                path = Path(bot_root) / "local" / "service_plugins"
+                self.local_services_dir = str(path) if path.exists() else None
+            else:
+                self.local_services_dir = None
         self.loaded_services: Dict[str, BaseServicePlugin] = {}
         self.service_metadata: Dict[str, Dict[str, Any]] = {}
         self.service_overrides: Dict[str, str] = {}
@@ -58,6 +69,22 @@ class ServicePluginLoader:
         
         self.logger.info(f"Discovered {len(service_files)} potential service files: {service_files}")
         return service_files
+    
+    def discover_local_services(self) -> List[str]:
+        """Discover Python files in local/service_plugins (stems). Same exclusions as built-in."""
+        if not self.local_services_dir:
+            return []
+        path = Path(self.local_services_dir)
+        if not path.exists():
+            return []
+        excluded = ["__init__.py", "base_service.py"]
+        stems = []
+        for file_path in path.glob("*.py"):
+            if file_path.name not in excluded and not file_path.name.endswith("_utils.py"):
+                stems.append(file_path.stem)
+        if stems:
+            self.logger.info(f"Discovered {len(stems)} local service file(s): {stems}")
+        return stems
     
     def load_service(self, service_name: str) -> Optional[BaseServicePlugin]:
         """Load a single service plugin by name"""
@@ -111,6 +138,71 @@ class ServicePluginLoader:
             
         except Exception as e:
             self.logger.error(f"Failed to load service {service_name}: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
+            return None
+    
+    def load_service_from_path(self, file_path: Path) -> Optional[BaseServicePlugin]:
+        """Load a single service plugin from a file path (e.g. local/service_plugins/my_service.py)."""
+        # Ensure parent package exists so relative/absolute imports of "local_services" work.
+        # Set __path__ so Python treats it as a package and can load submodules (e.g. local_services.utils).
+        if "local_services" not in sys.modules:
+            pkg = types.ModuleType("local_services")
+            builtin_services_dir = getattr(self, 'services_dir', None) or os.path.join(os.path.dirname(__file__), 'service_plugins')
+            modules_dir = os.path.dirname(__file__)  # so local_services.utils resolves to modules.utils
+            pkg.__path__ = [str(file_path.parent), builtin_services_dir, modules_dir]
+            sys.modules["local_services"] = pkg
+        stem = file_path.stem
+        module_name = f"local_services.{stem}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            if spec is None or spec.loader is None:
+                self.logger.warning(f"Could not create spec for {file_path}")
+                return None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            service_class = None
+            # Accept BaseServicePlugin from built-in (modules.service_plugins) or from local_services.base_service
+            # (same code loaded as different module when plugin does "from .base_service import BaseServicePlugin")
+            bases = [BaseServicePlugin]
+            local_base_module = sys.modules.get("local_services.base_service")
+            if local_base_module is not None:
+                local_base = getattr(local_base_module, "BaseServicePlugin", None)
+                if local_base is not None:
+                    bases.append(local_base)
+            for _name, obj in inspect.getmembers(module, inspect.isclass):
+                if obj in bases:
+                    continue
+                if (
+                    any(issubclass(obj, b) for b in bases)
+                    and obj.__module__ == module_name
+                ):
+                    service_class = obj
+                    break
+            if not service_class:
+                self.logger.warning(f"No valid service class found in {stem}")
+                return None
+            config_section = self._get_config_section_for_service(service_class)
+            if config_section and self.bot.config.has_section(config_section):
+                enabled = self.bot.config.getboolean(config_section, 'enabled', fallback=False)
+                if not enabled:
+                    self.logger.info(f"Local service {stem} is disabled in config (section: {config_section})")
+                    return None
+            elif config_section:
+                self.logger.info(
+                    f"Local service {stem} config section '{config_section}' exists but 'enabled' not set, skipping"
+                )
+                return None
+            service_instance = service_class(self.bot)
+            metadata = service_instance.get_metadata()
+            if not metadata.get('name'):
+                metadata['name'] = service_class.__name__.lower().replace('service', '')
+                service_instance.name = metadata['name']
+            self.logger.info(f"Successfully loaded local service: {metadata['name']} from {stem}")
+            return service_instance
+        except Exception as e:
+            self.logger.error(f"Failed to load local service {stem}: {e}")
             import traceback
             self.logger.debug(traceback.format_exc())
             return None
@@ -172,6 +264,25 @@ class ServicePluginLoader:
                         self.logger.info(f"Replacing service '{service_name}' with override '{override_file}'")
                     loaded_services[service_name] = override_instance
                     self.service_metadata[service_name] = override_metadata
+        
+        # Load local services from local/service_plugins (additive; duplicate names skipped)
+        if self.local_services_dir:
+            local_path = Path(self.local_services_dir)
+            for stem in self.discover_local_services():
+                file_path = local_path / f"{stem}.py"
+                if not file_path.is_file():
+                    continue
+                service_instance = self.load_service_from_path(file_path)
+                if service_instance:
+                    metadata = service_instance.get_metadata()
+                    service_name = metadata['name']
+                    if service_name in loaded_services:
+                        self.logger.warning(
+                            f"Local service '{stem}' has name '{service_name}' which is already loaded; skipping"
+                        )
+                        continue
+                    loaded_services[service_name] = service_instance
+                    self.service_metadata[service_name] = metadata
         
         self.loaded_services = loaded_services
         self.logger.info(f"Loaded {len(loaded_services)} service(s): {list(loaded_services.keys())}")

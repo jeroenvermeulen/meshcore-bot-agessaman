@@ -51,7 +51,7 @@ class GreeterCommand(BaseCommand):
         # Auto-start rollout if enabled, rollout_days > 0, and no active rollout exists
         if self.enabled and self.rollout_days > 0:
             try:
-                with self.bot.db_manager.get_connection() as conn:
+                with self.bot.db_manager.connection() as conn:
                     cursor = conn.cursor()
                     # Check for active rollout (more robust check)
                     cursor.execute('''
@@ -200,7 +200,7 @@ class GreeterCommand(BaseCommand):
     def _init_greeter_tables(self) -> None:
         """Initialize database tables for greeter tracking."""
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Create greeted_users table for tracking who has been greeted
@@ -250,7 +250,7 @@ class GreeterCommand(BaseCommand):
             return
         
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Check if there's an active rollout
@@ -306,7 +306,7 @@ class GreeterCommand(BaseCommand):
             rollout_id: The ID of the active rollout.
         """
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Get rollout start date
@@ -393,7 +393,7 @@ class GreeterCommand(BaseCommand):
             return {'success': False, 'error': 'Greeter is disabled'}
         
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Check if message_stats table exists
@@ -508,7 +508,7 @@ class GreeterCommand(BaseCommand):
             
             rollout_days = days or self.rollout_days
             
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Check if there's already an active rollout
@@ -582,7 +582,7 @@ class GreeterCommand(BaseCommand):
             return None
         
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 if self.per_channel_greetings:
@@ -623,7 +623,7 @@ class GreeterCommand(BaseCommand):
             bool: True if user has been greeted (globally or on this channel), False otherwise.
         """
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 if self.per_channel_greetings:
@@ -669,7 +669,7 @@ class GreeterCommand(BaseCommand):
         try:
             self.logger.debug(f"Marking {sender_id} as greeted (channel: {channel})")
             
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 # Use WAL mode for better concurrency (if not already enabled)
                 # This helps with race conditions
                 conn.execute('PRAGMA journal_mode=WAL')
@@ -800,7 +800,7 @@ class GreeterCommand(BaseCommand):
             int: The total count of greeted users.
         """
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT COUNT(*) FROM greeted_users')
                 count = cursor.fetchone()[0]
@@ -812,7 +812,7 @@ class GreeterCommand(BaseCommand):
     def _cleanup_duplicate_greetings(self) -> None:
         """Remove duplicate entries from greeted_users table."""
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Find duplicates - count how many exist per (sender_id, channel)
@@ -879,7 +879,7 @@ class GreeterCommand(BaseCommand):
             List[Dict[str, Any]]: A list of dictionaries containing greeted user info.
         """
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     SELECT sender_id, channel, MIN(greeted_at) as greeted_at, 
@@ -936,7 +936,7 @@ class GreeterCommand(BaseCommand):
             # Get recent activity from message_stats if available
             if info['recent_activity_24h'] == 0:
                 try:
-                    with self.bot.db_manager.get_connection() as conn:
+                    with self.bot.db_manager.connection() as conn:
                         cursor = conn.cursor()
                         # Check if message_stats table exists
                         cursor.execute('''
@@ -1059,7 +1059,7 @@ class GreeterCommand(BaseCommand):
             bool: True if a rollout is active, False otherwise.
         """
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 # Use SQLite's datetime functions to calculate end date and compare with current time
                 # This handles timezone issues automatically since both are in UTC
@@ -1121,7 +1121,7 @@ class GreeterCommand(BaseCommand):
             return False
         
         try:
-            with self.bot.db_manager.get_connection() as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Check if message_stats table exists
@@ -1262,27 +1262,10 @@ class GreeterCommand(BaseCommand):
             total_greeted = self.get_greeted_users_count()
             self.logger.debug(f"Database verification: {total_greeted} total user(s) marked as greeted")
             
-            # Send all greeting parts
-            success = True
-            for i, greeting_part in enumerate(greeting_parts):
-                if i > 0:
-                    # Wait for bot TX rate limiter between multi-part messages
-                    # This ensures we respect the bot's rate limiting configuration
-                    # Note: User rate limiter is not checked here since greeter is an automated bot response
-                    await self.bot.bot_tx_rate_limiter.wait_for_tx()
-                    
-                    # Additional delay to ensure proper spacing (use configured rate limit)
-                    rate_limit = self.bot.config.getfloat('Bot', 'bot_tx_rate_limit_seconds', fallback=1.0)
-                    # Use a conservative sleep time to avoid rate limiting
-                    sleep_time = max(rate_limit + 0.5, 1.0)  # At least 1 second, or rate_limit + 0.5 seconds
-                    await asyncio.sleep(sleep_time)
-                
-                # Skip user rate limiter for greeter messages since they're automated bot responses
-                result = await self.send_response(message, greeting_part, skip_user_rate_limit=True)
-                if not result:
-                    success = False
-                    self.logger.warning(f"Failed to send greeting part {i+1} of {len(greeting_parts)}")
-            
+            # Send all greeting parts (rate-limit spacing handled by send_response_chunked)
+            success = await self.send_response_chunked(message, greeting_parts)
+            if not success:
+                self.logger.warning("Failed to send one or more greeting parts")
             return success
         except Exception as e:
             self.logger.error(f"Error sending greeting: {e}")
@@ -1372,7 +1355,7 @@ class GreeterCommand(BaseCommand):
                 # If the record was just created (within last 5 seconds), we likely created it
                 # If it's older, another process may have created it first
                 try:
-                    with self.bot.db_manager.get_connection() as conn:
+                    with self.bot.db_manager.connection() as conn:
                         cursor = conn.cursor()
                         if self.per_channel_greetings:
                             cursor.execute('''

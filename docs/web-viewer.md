@@ -120,6 +120,8 @@ curl http://localhost:5000/api/stats
 
 The viewer uses the same database as the bot by default (`[Bot] db_path`, typically `meshcore_bot.db`). That single file holds repeater contacts, mesh graph, packet stream, and other data so the viewer can show everything.
 
+**Dashboard stats** (message/command counts, top users, etc.) come from the stats tables (`message_stats`, `command_stats`, `path_stats`). To populate these when the `stats` chat command is disabled, you can set the optional config under `[Stats_Command]`: `collect_stats = true`.
+
 ## Migrating from a separate web viewer database
 
 If you previously had the web viewer using a **separate** database (e.g. `[Web_Viewer] db_path = bot_data.db`), you can switch to the shared database so the viewer shows repeater/graph data and uses one file.

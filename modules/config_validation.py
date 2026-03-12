@@ -198,6 +198,26 @@ def validate_config(config_path: str) -> List[Tuple[str, str]]:
             msg = _check_path_writable(db_path, bot_root, "Database path")
             if msg:
                 results.append((SEVERITY_WARNING, msg))
+        # Optional: local_dir_path should exist and be readable when set
+        local_dir = config.get("Bot", "local_dir_path", fallback="").strip()
+        if local_dir:
+            try:
+                resolved = _resolve_path(local_dir, bot_root)
+                if not resolved.exists():
+                    results.append((
+                        SEVERITY_WARNING,
+                        f"Local plugins path '{resolved}' does not exist; local commands/plugins will not load.",
+                    ))
+                elif not os.access(str(resolved), os.R_OK):
+                    results.append((
+                        SEVERITY_WARNING,
+                        f"Local plugins path '{resolved}' is not readable.",
+                    ))
+            except (OSError, RuntimeError):
+                results.append((
+                    SEVERITY_WARNING,
+                    f"Local plugins path: cannot resolve '{local_dir}'.",
+                ))
     if config.has_section("Logging"):
         log_file = config.get("Logging", "log_file", fallback="").strip()
         if log_file:

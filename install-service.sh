@@ -308,6 +308,12 @@ copy_files_smart() {
             print_info "Preserving existing alternative commands (only updating if source is newer)"
         fi
         
+        # Preserve install dir's local/ entirely (user custom commands and service plugins)
+        # Never overwrite or delete anything under $dest_dir/local/
+        if [ -d "$dest_dir/local" ]; then
+            print_info "Preserving existing local/ directory (not overwriting)"
+        fi
+        
         # Exclude patterns
         rsync -a --update --exclude='.git' \
               --exclude='__pycache__' \
@@ -320,10 +326,20 @@ copy_files_smart() {
               --exclude='*.db-wal' \
               --exclude='*.log' \
               --exclude='backups' \
+              --exclude='local/' \
               $preserve_config \
               "$source_dir/" "$dest_dir/" 2>/dev/null || {
             print_warning "rsync had some issues, falling back to manual copy"
         }
+        # If install dir has no local/, create minimal structure from source so service has valid layout
+        if [ ! -d "$dest_dir/local" ]; then
+            print_info "Creating local/ directory structure (first-time install)"
+            mkdir -p "$dest_dir/local/commands" "$dest_dir/local/service_plugins"
+            [ -f "$source_dir/local/README.md" ] && cp "$source_dir/local/README.md" "$dest_dir/local/" || true
+            [ -f "$source_dir/local/__init__.py" ] && cp "$source_dir/local/__init__.py" "$dest_dir/local/" || true
+            [ -f "$source_dir/local/commands/.gitkeep" ] && cp "$source_dir/local/commands/.gitkeep" "$dest_dir/local/commands/" || true
+            [ -f "$source_dir/local/service_plugins/.gitkeep" ] && cp "$source_dir/local/service_plugins/.gitkeep" "$dest_dir/local/service_plugins/" || true
+        fi
         print_success "Files synchronized using rsync"
         return 0
     fi
@@ -334,6 +350,11 @@ copy_files_smart() {
     # Preserve alternatives directory if it exists
     if [ -d "$dest_dir/modules/commands/alternatives" ]; then
         print_info "Preserving existing alternative commands (not overwriting)"
+    fi
+    
+    # Preserve install dir's local/ entirely - never overwrite when it exists
+    if [ -d "$dest_dir/local" ]; then
+        print_info "Preserving existing local/ directory (not overwriting)"
     fi
     
     # Copy files, preserving config.ini if it exists
@@ -354,6 +375,12 @@ copy_files_smart() {
         [[ "$rel_path" == *".db-wal" ]] && continue
         [[ "$rel_path" == *".log" ]] && continue
         [[ "$rel_path" == *"/backups/"* ]] && continue
+        
+        # Preserve install dir's local/ entirely - skip all files under local/ when dest has local/
+        if [[ "$rel_path" == "local/"* ]] && [ -d "$dest_dir/local" ]; then
+            files_skipped=$((files_skipped + 1))
+            continue
+        fi
         
         # Preserve alternatives directory - only update if source file is newer
         if [[ "$rel_path" == "modules/commands/alternatives/"* ]] && [ -d "$dest_dir/modules/commands/alternatives" ]; then

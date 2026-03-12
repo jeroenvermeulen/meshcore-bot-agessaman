@@ -139,9 +139,75 @@ class TestMeshGraphEdgeManagement:
 
 
 @pytest.mark.unit
+class TestMeshGraphMultiResolution:
+    """Test multi-resolution storage and prefix-match lookup."""
+
+    def test_prefix_match_lookup(self, mesh_graph):
+        """Store (7e42, 8611); get_edge(7e, 86) returns it via prefix match; get_edge(7e42, 8611) exact."""
+        mesh_graph.add_edge("7e42", "8611")
+        # Short-prefix query returns the stored edge via prefix match
+        edge_short = mesh_graph.get_edge("7e", "86")
+        assert edge_short is not None
+        assert edge_short["from_prefix"] == "7e42"
+        assert edge_short["to_prefix"] == "8611"
+        # Exact query returns the same edge
+        edge_exact = mesh_graph.get_edge("7e42", "8611")
+        assert edge_exact is not None
+        assert edge_exact["from_prefix"] == "7e42"
+        assert edge_exact["to_prefix"] == "8611"
+        assert mesh_graph.has_edge("7e", "86") is True
+        assert mesh_graph.has_edge("7e42", "8611") is True
+
+    def test_prefix_match_best_of_two(self, mesh_graph):
+        """Two edges (7e42, 8611) and (7e99, 86ff); get_edge(7e, 86) returns one by tie-break (e.g. observation_count)."""
+        mesh_graph.add_edge("7e42", "8611")
+        for _ in range(4):
+            mesh_graph.add_edge("7e42", "8611")  # 5 observations
+        mesh_graph.add_edge("7e99", "86ff")  # 1 observation
+        edge = mesh_graph.get_edge("7e", "86")
+        assert edge is not None
+        # Tie-break: same specificity (4+4), then higher observation_count wins
+        assert edge["from_prefix"] == "7e42"
+        assert edge["to_prefix"] == "8611"
+        assert edge["observation_count"] == 5
+        # Exact lookups still work
+        assert mesh_graph.get_edge("7e42", "8611")["observation_count"] == 5
+        assert mesh_graph.get_edge("7e99", "86ff")["observation_count"] == 1
+
+    def test_get_outgoing_edges_prefix_match(self, mesh_graph):
+        """get_outgoing_edges(7e) returns edges from 7e42 and 7e99 when both exist."""
+        mesh_graph.add_edge("7e42", "8611")
+        mesh_graph.add_edge("7e99", "86ff")
+        outgoing = mesh_graph.get_outgoing_edges("7e")
+        assert len(outgoing) == 2
+        from_prefs = {e["from_prefix"] for e in outgoing}
+        assert from_prefs == {"7e42", "7e99"}
+
+    def test_get_incoming_edges_prefix_match(self, mesh_graph):
+        """get_incoming_edges(86) returns edges to 8611 and 86ff when both exist."""
+        mesh_graph.add_edge("7e42", "8611")
+        mesh_graph.add_edge("7e99", "86ff")
+        incoming = mesh_graph.get_incoming_edges("86")
+        assert len(incoming) == 2
+        to_prefs = {e["to_prefix"] for e in incoming}
+        assert to_prefs == {"8611", "86ff"}
+
+    def test_add_edge_rejects_invalid_length(self, mesh_graph):
+        """add_edge rejects prefixes that are not 2, 4, or 6 hex chars."""
+        mesh_graph.add_edge("7", "86")  # 1 char
+        assert mesh_graph.get_edge("7", "86") is None
+        assert len(mesh_graph.edges) == 0
+        mesh_graph.add_edge("7e4", "8611")  # 3 chars
+        assert len(mesh_graph.edges) == 0
+        mesh_graph.add_edge("7e42", "8611")  # 4 chars valid
+        assert mesh_graph.get_edge("7e42", "8611") is not None
+        assert len(mesh_graph.edges) == 1
+
+
+@pytest.mark.unit
 class TestMeshGraphPathValidation:
     """Test path segment and full path validation."""
-    
+
     def test_validate_path_segment_valid(self, mesh_graph):
         """Test validation with sufficient observations."""
         from_prefix = "01"

@@ -29,7 +29,8 @@
     "webviewer": ["webviewer", "web", "viewer", "wv"],
     "cmd": ["cmd", "commands"],
     "advert": ["advert"],
-    "multitest": ["multitest", "mt"]
+    "multitest": ["multitest", "mt"],
+    "trace": ["trace", "tracer"]
   },
   "commands": {
     "help": {
@@ -200,7 +201,8 @@
       },
       "paths": {
         "none": "No path data",
-        "format": "{rank} {sender} {path}"
+        "format": "{rank} {sender} {path}",
+        "synopsis": "{rank} {sender}: {hops} hops"
       },
       "adverts": {
         "header": "Top Advert Nodes (24h):",
@@ -245,7 +247,7 @@
     "path": {
       "description": "Decode hex path data to show which repeaters were involved in message routing",
       "help": "Path: path [hex] - Decode path to show repeaters. Use path alone for current message path, or path [7e,01] for specific path.",
-      "no_valid_hex": "❌ No valid hex values found in path data. Use format like: 11,98,a4,49,cd,5f,01",
+      "no_valid_hex": "❌ No valid hex values found in path data.",
       "no_path": "❌ No path information available in current message",
       "error": "Error processing path: {error}",
       "error_decoding": "❌ Error decoding path: {error}",
@@ -265,6 +267,10 @@
       "description": "Listens for 6 seconds and collects all unique paths from incoming messages with the same packet hash",
       "help": "Listens for 6 seconds and collects all unique paths from incoming messages with the same packet hash"
     },
+    "trace": {
+      "description": "Run link trace (trace=manual path, tracer=round-trip so bot hears return)",
+      "help": "trace [path] — manual path (return may not be heard). tracer [path] — round-trip. Path: comma 2-char hex (e.g. 01,7a,55). No path = use your message path."
+    },
     "prefix": {
       "description": "Look up repeaters by two-character prefix (e.g., 'prefix 1A')",
       "help_api": "Look up repeaters by prefix{location_note}. Usage: 'prefix 1A', 'prefix 1A all', 'prefix free'.",
@@ -273,13 +279,14 @@
       "refresh_not_available": "❌ Refresh not available - no API URL configured. Using local database only.",
       "cache_refreshed": "🔄 Repeater prefix cache refreshed!",
       "unable_determine_free": "❌ Unable to determine free prefixes. Try 'prefix refresh' first.",
-      "invalid_format": "❌ Invalid prefix format. Use two characters (e.g., prefix 1A)",
+      "invalid_format": "❌ Invalid prefix format. Expected {prefix_hex_chars} hex characters.",
       "no_repeaters_found": "❌ No repeaters found with prefix '{prefix}'",
       "no_free_prefixes": "❌ No free prefixes found (all 254 valid prefixes are in use)",
       "available_prefixes": "Available Prefixes ({shown} of {total} free):",
       "generate_key": "💡 Generate a custom key: https://gessaman.com/mc-keygen",
       "prefix_db_all": "Prefix {prefix}: {count} repeater{plural}",
       "prefix_db_recent": "Prefix {prefix}: {count} repeater{plural} ({days})",
+      "older_entries_note": "(Entries may be older than {days} days)",
       "prefix_api": "📡 Prefix {prefix} ({count} repeater{plural}):",
       "item_format": "{index}. {name}",
       "source_domain": "Source: {domain}",

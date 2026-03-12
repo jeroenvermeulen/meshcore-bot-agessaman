@@ -5,12 +5,13 @@ Listens for a period of time and collects all unique paths from incoming message
 """
 
 import asyncio
+import re
 import time
 from typing import Set, Optional, Dict
 from dataclasses import dataclass
 from .base_command import BaseCommand
 from ..models import MeshMessage
-from ..utils import calculate_packet_hash
+from ..utils import calculate_packet_hash, parse_path_string
 
 
 @dataclass
@@ -113,75 +114,109 @@ class MultitestCommand(BaseCommand):
         return False
     
     def extract_path_from_rf_data(self, rf_data: dict) -> Optional[str]:
-        """Extract path in prefix string format from RF data routing_info"""
+        """Extract path in prefix string format from RF data routing_info.
+        Supports 1-, 2-, and 3-byte-per-hop (2, 4, or 6 hex chars per node).
+        """
         try:
             routing_info = rf_data.get('routing_info')
             if not routing_info:
                 return None
-            
+
             path_nodes = routing_info.get('path_nodes', [])
             if not path_nodes:
-                # Try to extract from path_hex if path_nodes not available
+                # Fallback: build from path_hex using bytes_per_hop from packet
                 path_hex = routing_info.get('path_hex', '')
                 if path_hex:
-                    # Convert hex string to node list (every 2 characters = 1 node)
-                    path_nodes = [path_hex[i:i+2] for i in range(0, len(path_hex), 2)]
-            
+                    bytes_per_hop = routing_info.get('bytes_per_hop')
+                    n = (bytes_per_hop * 2) if bytes_per_hop and bytes_per_hop >= 1 else getattr(self.bot, 'prefix_hex_chars', 2)
+                    if n <= 0:
+                        n = 2
+                    path_nodes = [path_hex[i:i + n] for i in range(0, len(path_hex), n)]
+                    if (len(path_hex) % n) != 0:
+                        path_nodes = [path_hex[i:i + 2] for i in range(0, len(path_hex), 2)]
+
             if path_nodes:
-                # Validate and format path nodes
+                # Validate: each node 2, 4, or 6 hex chars
                 valid_parts = []
                 for node in path_nodes:
-                    # Convert to string if needed
                     node_str = str(node).lower().strip()
-                    # Check if it's a 2-character hex value
-                    if len(node_str) == 2 and all(c in '0123456789abcdef' for c in node_str):
+                    if len(node_str) in (2, 4, 6) and all(c in '0123456789abcdef' for c in node_str):
                         valid_parts.append(node_str)
-                
                 if valid_parts:
                     return ','.join(valid_parts)
-            
             return None
         except Exception as e:
             self.logger.debug(f"Error extracting path from RF data: {e}")
             return None
     
     def extract_path_from_message(self, message: MeshMessage) -> Optional[str]:
-        """Extract path in prefix string format from a message"""
+        """Extract path in prefix string format from a message.
+        Prefers message.routing_info.path_nodes when present (multi-byte).
+        When routing_info has bytes_per_hop, uses it instead of inferring hop size.
+        Otherwise parses message.path: comma-separated tokens infer (2/4/6 hex);
+        continuous hex uses bot.prefix_hex_chars via parse_path_string().
+        """
+        routing_info = getattr(message, 'routing_info', None)
+        bytes_per_hop = routing_info.get('bytes_per_hop') if routing_info else None
+        hex_chars_per_node = (bytes_per_hop * 2) if (bytes_per_hop and bytes_per_hop >= 1) else None
+
+        # Prefer routing_info when present (same as path command; no re-parse)
+        if routing_info is not None:
+            if routing_info.get('path_length', 0) == 0:
+                return None
+            path_nodes = routing_info.get('path_nodes', [])
+            if not path_nodes and hex_chars_per_node:
+                # Build from path_hex when path_nodes missing but bytes_per_hop known
+                path_hex = routing_info.get('path_hex', '')
+                if path_hex:
+                    n = hex_chars_per_node
+                    path_nodes = [path_hex[i:i + n] for i in range(0, len(path_hex), n)]
+                    if (len(path_hex) % n) != 0:
+                        path_nodes = [path_hex[i:i + 2] for i in range(0, len(path_hex), 2)]
+            if path_nodes:
+                valid = [str(n).lower().strip() for n in path_nodes
+                         if len(str(n).strip()) in (2, 4, 6) and all(c in '0123456789abcdef' for c in str(n).lower().strip())]
+                if valid:
+                    return ','.join(valid)
         if not message.path:
             return None
-        
-        # Check if it's a direct connection
         if "Direct" in message.path or "0 hops" in message.path:
             return None
-        
-        # Try to extract path nodes from the path string
-        # Path strings are typically in format: "node1,node2,node3 via ROUTE_TYPE_*"
-        # or just "node1,node2,node3"
+
         path_string = message.path
-        
-        # Remove route type suffix if present
         if " via ROUTE_TYPE_" in path_string:
             path_string = path_string.split(" via ROUTE_TYPE_")[0]
-        
-        # Check if it looks like a comma-separated path
+        path_string = re.sub(r'\s*\([^)]*hops?[^)]*\)', '', path_string, flags=re.IGNORECASE).strip()
+
+        # When bytes_per_hop is known, use it; otherwise infer from commas or use bot.prefix_hex_chars
+        expected_n = hex_chars_per_node or getattr(self.bot, 'prefix_hex_chars', 2)
+        if expected_n <= 0:
+            expected_n = 2
+
         if ',' in path_string:
-            # Clean up any extra info (like hop counts in parentheses)
-            # Example: "01,7e,55,86 (4 hops)" -> "01,7e,55,86"
-            if '(' in path_string:
-                path_string = path_string.split('(')[0].strip()
-            
-            # Validate that all parts are 2-character hex values
-            parts = path_string.split(',')
-            valid_parts = []
-            for part in parts:
-                part = part.strip()
-                # Check if it's a 2-character hex value
-                if len(part) == 2 and all(c in '0123456789abcdefABCDEF' for c in part):
-                    valid_parts.append(part.lower())
-            
-            if valid_parts:
-                return ','.join(valid_parts)
-        
+            tokens = [t.strip() for t in path_string.split(',') if t.strip()]
+            if tokens:
+                if hex_chars_per_node:
+                    # Use known hop size: all tokens must be that length
+                    valid_hex = all(
+                        len(t) == expected_n and all(c in '0123456789aAbBcCdDeEfF' for c in t)
+                        for t in tokens
+                    )
+                    if valid_hex:
+                        return ','.join(t.lower() for t in tokens)
+                else:
+                    # Infer from token length (2, 4, or 6, all same)
+                    lengths = {len(t) for t in tokens}
+                    valid_hex = all(
+                        len(t) in (2, 4, 6) and all(c in '0123456789aAbBcCdDeEfF' for c in t)
+                        for t in tokens
+                    )
+                    if valid_hex and len(lengths) == 1 and next(iter(lengths)) in (2, 4, 6):
+                        return ','.join(t.lower() for t in tokens)
+        # Continuous hex: use bytes_per_hop when known, else bot.prefix_hex_chars
+        node_ids = parse_path_string(path_string, prefix_hex_chars=expected_n)
+        if node_ids:
+            return ','.join(n.lower() for n in node_ids)
         return None
     
     def get_rf_data_for_message(self, message: MeshMessage) -> Optional[dict]:

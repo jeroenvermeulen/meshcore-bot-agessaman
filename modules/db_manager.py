@@ -7,8 +7,9 @@ Provides common database operations and table management for the MeshCore Bot
 import sqlite3
 import json
 import re
+from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Generator
 from pathlib import Path
 
 
@@ -49,7 +50,7 @@ class DBManager:
         activity logs, and proper indexes for performance optimization.
         """
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Create geocoding_cache table for weather command optimization
@@ -234,7 +235,7 @@ class DBManager:
             if found and valid, otherwise (None, None).
         """
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     SELECT latitude, longitude FROM geocoding_cache 
@@ -262,7 +263,7 @@ class DBManager:
             if not isinstance(cache_hours, int) or cache_hours < 1 or cache_hours > 87600:  # Max 10 years
                 raise ValueError(f"cache_hours must be an integer between 1 and 87600, got: {cache_hours}")
             
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 # Use parameter binding instead of string formatting
                 cursor.execute('''
@@ -286,7 +287,7 @@ class DBManager:
             Optional[str]: Cached string value if found and valid, None otherwise.
         """
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     SELECT cache_value FROM generic_cache 
@@ -314,7 +315,7 @@ class DBManager:
             if not isinstance(cache_hours, int) or cache_hours < 1 or cache_hours > 87600:  # Max 10 years
                 raise ValueError(f"cache_hours must be an integer between 1 and 87600, got: {cache_hours}")
             
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 # Use parameter binding instead of string formatting
                 cursor.execute('''
@@ -368,7 +369,7 @@ class DBManager:
         expiration timestamp has passed.
         """
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Clean up geocoding cache
@@ -391,10 +392,11 @@ class DBManager:
     def cleanup_geocoding_cache(self) -> None:
         """Remove expired geocoding cache entries"""
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM geocoding_cache WHERE expires_at < datetime('now')")
                 deleted_count = cursor.rowcount
+                conn.commit()
                 if deleted_count > 0:
                     self.logger.info(f"Cleaned up {deleted_count} expired geocoding cache entries")
         except Exception as e:
@@ -404,7 +406,7 @@ class DBManager:
     def get_database_stats(self) -> Dict[str, Any]:
         """Get database statistics"""
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 
                 stats = {}
@@ -443,7 +445,7 @@ class DBManager:
         Executes the VACUUM command to rebuild the database file and reduce size.
         """
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 conn.execute("VACUUM")
                 self.logger.info("Database vacuum completed")
         except Exception as e:
@@ -469,7 +471,7 @@ class DBManager:
             if not re.match(r'^[a-z_][a-z0-9_]*$', table_name):
                 raise ValueError(f"Invalid table name format: {table_name}")
             
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 # Table names cannot be parameterized, but we've validated against whitelist
                 cursor.execute(f'CREATE TABLE IF NOT EXISTS {table_name} ({schema})')
@@ -500,7 +502,7 @@ class DBManager:
             # Extra safety: log critical action
             self.logger.warning(f"CRITICAL: Dropping table '{table_name}'")
             
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 # Table names cannot be parameterized, but we've validated against whitelist
                 cursor.execute(f'DROP TABLE IF EXISTS {table_name}')
@@ -513,7 +515,7 @@ class DBManager:
     def execute_query(self, query: str, params: Tuple = ()) -> List[Dict]:
         """Execute a custom query and return results as list of dictionaries"""
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 cursor.execute(query, params)
@@ -526,7 +528,7 @@ class DBManager:
     def execute_update(self, query: str, params: Tuple = ()) -> int:
         """Execute an update/insert/delete query and return number of affected rows"""
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(query, params)
                 conn.commit()
@@ -562,7 +564,7 @@ class DBManager:
             value: Metadata string value.
         """
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT OR REPLACE INTO bot_metadata (key, value, updated_at)
@@ -582,7 +584,7 @@ class DBManager:
             Optional[str]: Value string if found, None otherwise.
         """
         try:
-            with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+            with self.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('SELECT value FROM bot_metadata WHERE key = ?', (key,))
                 result = cursor.fetchone()
@@ -608,8 +610,22 @@ class DBManager:
         """Set bot start time in metadata"""
         self.set_metadata('start_time', str(start_time))
     
+    @contextmanager
+    def connection(self) -> Generator[sqlite3.Connection, None, None]:
+        """Context manager that yields a configured connection and closes it on exit.
+        Use this instead of get_connection() in with-statements to avoid leaking file descriptors.
+        """
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+    
     def get_connection(self) -> sqlite3.Connection:
-        """Get a database connection with proper configuration
+        """Get a database connection with proper configuration.
+        Caller must close the connection (e.g. conn.close() in finally).
+        Prefer connection() when using a with-statement so the connection is closed automatically.
         
         Returns:
             sqlite3.Connection with row factory and timeout configured

@@ -284,7 +284,7 @@ class FeedManager:
             
             # Query database for all processed item IDs for this feed
             try:
-                with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+                with self.bot.db_manager.connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute('''
                         SELECT DISTINCT item_id FROM feed_activity
@@ -443,7 +443,7 @@ class FeedManager:
             
             # Query database for all processed item IDs for this feed
             try:
-                with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+                with self.bot.db_manager.connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute('''
                         SELECT DISTINCT item_id FROM feed_activity
@@ -954,7 +954,7 @@ class FeedManager:
     def _queue_feed_message(self, feed: Dict[str, Any], item: Dict[str, Any], message: str):
         """Queue a feed message for later sending"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO feed_message_queue 
@@ -1111,7 +1111,7 @@ class FeedManager:
     def _get_enabled_feeds(self) -> List[Dict[str, Any]]:
         """Get all enabled feed subscriptions from database"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 cursor.execute('''
@@ -1134,7 +1134,7 @@ class FeedManager:
             now = datetime.now(timezone.utc)
             now_str = now.isoformat()  # ISO format: 2025-12-05T12:34:56.789+00:00
             
-            with sqlite3.connect(self.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     UPDATE feed_subscriptions
@@ -1150,7 +1150,7 @@ class FeedManager:
     def _update_feed_last_item_id(self, feed_id: int, item_id: str):
         """Update the last processed item ID for a feed"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     UPDATE feed_subscriptions
@@ -1165,7 +1165,7 @@ class FeedManager:
     def _record_feed_activity(self, feed_id: int, item_id: str, item_title: str):
         """Record that a feed item was processed"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO feed_activity (feed_id, item_id, item_title, message_sent)
@@ -1178,7 +1178,7 @@ class FeedManager:
     def _record_feed_error(self, feed_id: int, error_type: str, error_message: str):
         """Record a feed error"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO feed_errors (feed_id, error_type, error_message)
@@ -1193,7 +1193,7 @@ class FeedManager:
         try:
             # Get all unsent messages, ordered by priority and queue time
             db_path = str(self.db_path)  # Ensure string, not Path object
-            with sqlite3.connect(db_path, timeout=30.0) as conn:
+            with self.bot.db_manager.connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 cursor.execute('''
@@ -1237,7 +1237,7 @@ class FeedManager:
                     
                     if success:
                         # Mark as sent
-                        with sqlite3.connect(db_path, timeout=30.0) as conn:
+                        with self.bot.db_manager.connection() as conn:
                             cursor = conn.cursor()
                             cursor.execute('''
                                 UPDATE feed_message_queue
@@ -1263,7 +1263,7 @@ class FeedManager:
         except Exception as e:
             db_path = getattr(self, 'db_path', 'unknown')
             db_path_str = str(db_path) if db_path != 'unknown' else 'unknown'
-            self.logger.error(f"Error processing message queue: {e}")
+            self.logger.exception(f"Error processing message queue: {e}")
             if db_path_str != 'unknown':
                 path_obj = Path(db_path_str)
                 self.logger.error(f"Database path: {db_path_str} (exists: {path_obj.exists()}, readable: {os.access(db_path_str, os.R_OK) if path_obj.exists() else False}, writable: {os.access(db_path_str, os.W_OK) if path_obj.exists() else False})")

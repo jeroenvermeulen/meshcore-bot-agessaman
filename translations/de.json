@@ -306,7 +306,8 @@
             },
             "paths": {
                 "none": "Keine Pfad-Daten",
-                "format": "{rank} {sender} {path}"
+                "format": "{rank} {sender} {path}",
+                "synopsis": "{rank} {sender}: {hops} hops"
             }
         },
         "solarforecast": {

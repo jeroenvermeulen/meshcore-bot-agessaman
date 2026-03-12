@@ -135,10 +135,7 @@ class ChannelManager:
     def _store_channels_in_db(self, channels: List[Dict[str, Any]]):
         """Store channel information in database for web viewer access (full refresh - clears all first)"""
         try:
-            import sqlite3
-            db_path = self.bot.db_manager.db_path
-            
-            with sqlite3.connect(db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Clear existing channels (full refresh)
@@ -156,10 +153,7 @@ class ChannelManager:
     def _store_single_channel_in_db(self, channel: Dict[str, Any]):
         """Store or update a single channel in database (without clearing others)"""
         try:
-            import sqlite3
-            db_path = self.bot.db_manager.db_path
-            
-            with sqlite3.connect(db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 self._insert_channel_in_db(cursor, channel)
                 conn.commit()
@@ -710,9 +704,7 @@ class ChannelManager:
                         del self._channels_cache[channel_idx]
                     # Update database - remove the channel
                     try:
-                        import sqlite3
-                        db_path = self.bot.db_manager.db_path
-                        with sqlite3.connect(db_path) as conn:
+                        with self.bot.db_manager.connection() as conn:
                             cursor = conn.cursor()
                             cursor.execute('DELETE FROM channels WHERE channel_idx = ?', (channel_idx,))
                             conn.commit()

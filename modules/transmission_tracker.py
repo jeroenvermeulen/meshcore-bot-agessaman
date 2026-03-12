@@ -5,6 +5,7 @@ Tracks transmitted message hashes and detects repeats from neighboring repeaters
 """
 
 import time
+from contextlib import closing
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass, field
 from collections import defaultdict
@@ -59,7 +60,7 @@ class TransmissionTracker:
                 if hasattr(device_info, 'public_key'):
                     pubkey = device_info.public_key
                     if isinstance(pubkey, str) and len(pubkey) >= 2:
-                        self.bot_prefix = pubkey[:2].lower()
+                        self.bot_prefix = pubkey[:self.bot.prefix_hex_chars].lower()
                     elif isinstance(pubkey, bytes) and len(pubkey) >= 1:
                         self.bot_prefix = f"{pubkey[0]:02x}".lower()
                     self.logger.debug(f"Bot prefix set to: {self.bot_prefix}")
@@ -198,7 +199,7 @@ class TransmissionTracker:
                 from pathlib import Path
                 db_path = Path(self.bot.db_manager.db_path).resolve()
             
-            with sqlite3.connect(str(db_path), timeout=30.0) as conn:
+            with closing(sqlite3.connect(str(db_path), timeout=30.0)) as conn:
                 cursor = conn.cursor()
                 
                 # Find the command entry by command_id
@@ -300,7 +301,7 @@ class TransmissionTracker:
             last_node = path_nodes[-1]
             if isinstance(last_node, str) and len(last_node) >= 2:
                 # Take first 2 characters as prefix
-                prefix = last_node[:2].lower()
+                prefix = last_node[:self.bot.prefix_hex_chars].lower()
                 # Filter out our own prefix
                 if prefix != self.bot_prefix:
                     return [prefix]
@@ -318,7 +319,7 @@ class TransmissionTracker:
             if parts:
                 last_part = parts[-1]
                 if len(last_part) >= 2:
-                    prefix = last_part[:2].lower()
+                    prefix = last_part[:self.bot.prefix_hex_chars].lower()
                     # Filter out our own prefix
                     if prefix != self.bot_prefix:
                         return [prefix]

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Any
 from datetime import datetime
 import pytz
+import random
 from meshcore import EventType
 
 from .models import MeshMessage
@@ -88,7 +89,12 @@ class CommandManager:
         self.command_prefix = self.load_command_prefix()
         
         # Initialize plugin loader and load all plugins
-        self.plugin_loader = PluginLoader(bot)
+        local_commands_dir = (
+            str(bot._local_root / "commands")
+            if getattr(bot, "_local_root", None) is not None
+            else str(bot.bot_root / "local" / "commands")
+        )
+        self.plugin_loader = PluginLoader(bot, local_commands_dir=local_commands_dir)
         self.commands = self.plugin_loader.load_all_plugins()
         
         # Cache for internet connectivity status to avoid checking on every command
@@ -258,7 +264,18 @@ class CommandManager:
     def get_rate_limit_key(self, message: MeshMessage) -> Optional[str]:
         """Return the key used for per-user rate limiting (pubkey when available, else sender name)."""
         return message.sender_pubkey or message.sender_id or None
-    
+
+    def get_rate_limit_wait_seconds(self, rate_limit_key: Optional[str] = None) -> float:
+        """Return seconds to wait until we could pass rate limits (for reply retry)."""
+        wait = 0.0
+        if not self.bot.rate_limiter.can_send():
+            wait = max(wait, self.bot.rate_limiter.time_until_next())
+        if getattr(self.bot, "per_user_rate_limit_enabled", False) and rate_limit_key:
+            per_user = getattr(self.bot, "per_user_rate_limiter", None)
+            if per_user and not per_user.can_send(rate_limit_key):
+                wait = max(wait, per_user.time_until_next(rate_limit_key))
+        return wait
+
     async def _check_rate_limits(
         self, skip_user_rate_limit: bool = False, rate_limit_key: Optional[str] = None
     ) -> Tuple[bool, str]:
@@ -628,7 +645,134 @@ class CommandManager:
                         self.logger.warning(f"Error formatting response for '{keyword}': {e}")
                         matches.append((keyword, response_format))
         
-        return matches
+        return matches  
+
+    def _normalize_trigger_text(self, raw: str) -> str:
+        """
+        Normalize user input / triggers:
+        - strip configured command_prefix if present
+        - strip legacy leading "!" if no command_prefix configured
+        - lowercase
+        - trim + collapse whitespace
+        """
+        if raw is None:
+            return ""
+        text = raw.strip()
+
+        # Mirror check_keywords() prefix handling
+        if self.command_prefix:
+            if not text.startswith(self.command_prefix):
+                return ""  # No prefix -> treat as non-matchable
+            text = text[len(self.command_prefix):].strip()
+        else:
+            # Backward compatibility
+            if text.startswith('!'):
+                text = text[1:].strip()
+
+        # case-insensitive + ignore extra spaces
+        return " ".join(text.lower().split())
+
+    def match_randomline(self, message: MeshMessage) -> Optional[Tuple[str, str]]:
+        """
+        Exact-match message content against RandomLine triggers.
+        Returns (key, response) or None.
+        Matching is case-insensitive and ignores extra spaces.
+        """
+        if not self.bot.config.has_section('RandomLine'):
+            return None
+
+        # Start with the same content + prefix stripping logic as check_keywords()
+        content = (message.content or "").strip()
+
+        # Check for command prefix if configured
+        if self.command_prefix:
+            if not content.startswith(self.command_prefix):
+                return None
+            content = content[len(self.command_prefix):].strip()
+        else:
+            # Legacy "!" prefix compatibility
+            if content.startswith('!'):
+                content = content[1:].strip()
+
+        # Normalize: lowercase + collapse whitespace
+        content_norm = " ".join(content.lower().split())
+        if not content_norm:
+            return None
+
+        # Build trigger -> key map from config: triggers.<key> = csv list
+        trigger_map = {}
+        for cfg_key, cfg_val in self.bot.config.items('RandomLine'):
+            if not cfg_key.startswith('triggers.'):
+                continue
+
+            key = cfg_key.split('.', 1)[1].strip()
+            if not key:
+                continue
+
+            raw_triggers = [t.strip() for t in (cfg_val or "").split(",") if t.strip()]
+            for trig in raw_triggers:
+                trig_norm = " ".join(trig.lower().split())
+                if trig_norm:
+                    trigger_map[trig_norm] = key
+
+        key = trigger_map.get(content_norm)
+        if not key:
+            return None
+
+        # Channel restrictions (mirror the plain keyword restrictions)
+        if message.is_dm:
+            if not self.bot.config.getboolean('Channels', 'respond_to_dms', fallback=True):
+                return None
+        else:
+            # Optional per-trigger channel list: channel.<key> or channels.<key> (e.g. channel.momjoke = #jokes)
+            # When set, trigger is allowed only in those channels (even if not in global monitor_channels)
+            channel_opt = self.bot.config.get('RandomLine', f'channel.{key}', fallback='').strip()
+            if not channel_opt:
+                channel_opt = self.bot.config.get('RandomLine', f'channels.{key}', fallback='').strip()
+            if channel_opt:
+                allowed = [ch.strip() for ch in channel_opt.split(',') if ch.strip()]
+                if allowed:
+                    # Normalize for comparison: lowercase, strip optional #
+                    msg_ch = (message.channel or '').lower().strip().lstrip('#')
+                    allowed_normalized = {ch.lower().strip().lstrip('#') for ch in allowed}
+                    if msg_ch not in allowed_normalized:
+                        return None
+                    # Per-trigger channels allowed even when not in monitor_channels; skip global check
+                else:
+                    if message.channel not in self.monitor_channels:
+                        return None
+            else:
+                if message.channel not in self.monitor_channels:
+                    return None
+            if not self._is_channel_trigger_allowed(key, message):
+                return None
+
+        file_path = self.bot.config.get('RandomLine', f'file.{key}', fallback='').strip()
+        if not file_path:
+            self.logger.warning(f"RandomLine matched '{key}' but missing config file.{key}")
+            return None
+
+        # Read usable lines
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f.readlines()]
+            lines = [ln for ln in lines if ln]  # drop blank lines
+        except Exception as e:
+            self.logger.error(f"RandomLine error reading {file_path} for '{key}': {e}", exc_info=True)
+            return None
+
+        if not lines:
+            self.logger.warning(f"RandomLine file is empty for '{key}': {file_path}")
+            return None
+
+        chosen = random.choice(lines)
+
+        prefix = self.bot.config.get('RandomLine', f'prefix.{key}', fallback='').strip()
+        if not prefix:
+            prefix = (self.bot.config.get('RandomLine', 'prefix.default', fallback='') or '').strip()
+
+        response = f"{prefix} {chosen}".strip() if prefix else chosen
+        return key, response
     
     async def handle_advert_command(self, message: MeshMessage):
         """Handle the advert command from DM.
@@ -769,20 +913,13 @@ class CommandManager:
         command_id: Optional[str] = None,
         skip_user_rate_limit: bool = False,
         rate_limit_key: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bool:
-        """Send a channel message using meshcore-cli command.
+        """Send a channel message using meshcore_py (optional flood scope).
         
         Resolves channel names to numbers and handles rate limiting.
-        
-        Args:
-            channel: The channel name (e.g., "LongFast").
-            content: The message content to send.
-            command_id: Optional command_id for repeat tracking (if not provided, one will be generated).
-            skip_user_rate_limit: If True, skip user rate limiter checks (for automated responses).
-            rate_limit_key: Optional key for per-user rate limiting (e.g. from get_rate_limit_key(message)).
-            
-        Returns:
-            bool: True if sent successfully, False otherwise.
+        If [Channels] flood_scope is set (or scope is passed), uses that scope
+        for this send then restores global flood. Scope values "" / "*" / "0" mean global.
         """
         if not self.bot.connected or not self.bot.meshcore:
             return False
@@ -822,19 +959,98 @@ class CommandManager:
                 self.logger.debug(f"Error recording transmission for repeat tracking: {e}")
                 # Don't fail the send if transmission tracking fails
             
-            # Use meshcore-cli send_chan_msg function
-            from meshcore_cli.meshcore_cli import send_chan_msg
-            result = await send_chan_msg(self.bot.meshcore, channel_num, content)
+            # Optional flood scope (region): set before send, restore after
+            scope_cfg = ""
+            if self.bot.config.has_section("Channels") and self.bot.config.has_option("Channels", "flood_scope"):
+                scope_cfg = (self.bot.config.get("Channels", "flood_scope") or "").strip()
+            scope_to_use = (scope if scope is not None else scope_cfg) or ""
+            scope_is_global = scope_to_use in ("", "*", "0", "None")
+            if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                await self.bot.meshcore.commands.set_flood_scope(scope_to_use)
+            
+            try:
+                # Use meshcore_py directly (no meshcore-cli for channel sends)
+                result = await self.bot.meshcore.commands.send_chan_msg(channel_num, content)
+            finally:
+                if not scope_is_global and hasattr(self.bot.meshcore.commands, "set_flood_scope"):
+                    await self.bot.meshcore.commands.set_flood_scope("*")
             
             # Handle result using unified handler
             target = f"{channel} (channel {channel_num})"
-            return self._handle_send_result(
+            success = self._handle_send_result(
                 result, "Channel message", target, rate_limit_key=rate_limit_key
             )
+            if success and getattr(self.bot, 'channel_sent_listeners', None):
+                bot_name = self.bot.config.get('Bot', 'bot_name', fallback='Bot')
+                payload = {'channel_idx': channel_num, 'text': f'{bot_name}: {content}'}
+                synthetic_event = type('Event', (), {'payload': payload})()
+                for cb in list(self.bot.channel_sent_listeners):
+                    async def _run_listener(listener, event):
+                        try:
+                            await listener(event, None)
+                        except Exception as e:
+                            self.logger.warning(
+                                "Channel sent listener error: %s", e, exc_info=True
+                            )
+                    asyncio.create_task(_run_listener(cb, synthetic_event))
+            return success
                 
         except Exception as e:
             self.logger.error(f"Failed to send channel message: {e}")
             return False
+    
+    async def send_channel_messages_chunked(
+        self,
+        channel: str,
+        chunks: List[str],
+        *,
+        command_id: Optional[str] = None,
+        skip_user_rate_limit: bool = True,
+        rate_limit_key: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> bool:
+        """Send multiple channel messages with rate-limit spacing between chunks.
+        
+        Uses bot_tx_rate_limiter and configured bot_tx_rate_limit_seconds so each
+        chunk after the first is spaced correctly. For the first chunk, uses the
+        provided skip_user_rate_limit and rate_limit_key; subsequent chunks
+        always use skip_user_rate_limit=True so automated multi-part sends work.
+        
+        Args:
+            channel: Channel name to send to.
+            chunks: List of message strings to send in order.
+            command_id: Optional command_id for repeat tracking.
+            skip_user_rate_limit: If True, skip user/global rate limit for first chunk (default True for services).
+            rate_limit_key: Optional key for per-user rate limit on first chunk only.
+            scope: Optional flood scope for send (see send_channel_message).
+        
+        Returns:
+            bool: True if all chunks were sent successfully, False on first failure.
+        """
+        if not chunks:
+            return True
+        rate_limit_seconds = self.bot.config.getfloat('Bot', 'bot_tx_rate_limit_seconds', fallback=1.0)
+        sleep_time = max(rate_limit_seconds + 0.5, 1.0)
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                await self.bot.bot_tx_rate_limiter.wait_for_tx()
+                await asyncio.sleep(sleep_time)
+            skip_first = skip_user_rate_limit if i == 0 else True
+            key_first = rate_limit_key if i == 0 else None
+            success = await self.send_channel_message(
+                channel,
+                chunk,
+                command_id=command_id,
+                skip_user_rate_limit=skip_first,
+                rate_limit_key=key_first,
+                scope=scope,
+            )
+            if not success:
+                self.logger.warning(
+                    "Chunked channel send failed at chunk %d of %d to %s", i + 1, len(chunks), channel
+                )
+                return False
+        return True
     
     def get_help_for_command(self, command_name: str, message: MeshMessage = None) -> str:
         """Get help text for a specific command (LoRa-friendly compact format).
@@ -913,10 +1129,15 @@ class CommandManager:
             return self.bot.translator.translate('commands.help.unknown', command=command_name, available=available_str)
         return f"Unknown: {command_name}. Available: {available_str}. Try 'help' for command list."
     
+    # Prefix and suffix for general help (reserve space so suffix is never cut off)
+    _HELP_PREFIX = "Bot Help: "
+    _HELP_SUFFIX = " | More: 'help <command>'"
+
     def get_general_help(self, message: MeshMessage = None) -> str:
         """Get general help text from config (LoRa-friendly compact format).
-        
+
         When message is provided, only lists commands valid for the message's channel.
+        Reserves space for the suffix so the message always ends with | More: 'help <command>'.
         """
         # Prefer keywords config if user has customized help
         if 'help' in self.keywords:
@@ -925,8 +1146,12 @@ class CommandManager:
         if 'help' in self.commands:
             help_command = self.commands['help']
             if hasattr(help_command, 'get_available_commands_list'):
-                available_str = help_command.get_available_commands_list(message)
-                return f"Bot Help: {available_str} | More: 'help <command>'"
+                max_list = None
+                if message and hasattr(help_command, 'get_max_message_length'):
+                    max_total = help_command.get_max_message_length(message)
+                    max_list = max_total - len(self._HELP_PREFIX) - len(self._HELP_SUFFIX)
+                available_str = help_command.get_available_commands_list(message, max_length=max_list)
+                return f"{self._HELP_PREFIX}{available_str}{self._HELP_SUFFIX}"
         # Last resort: simple list of command names (filtered by channel when message provided)
         help_cmd = self.commands.get('help')
         if help_cmd and hasattr(help_cmd, '_is_command_valid_for_channel') and message:
@@ -940,7 +1165,17 @@ class CommandManager:
                 cmd.name if hasattr(cmd, 'name') else name
                 for name, cmd in self.commands.items()
             ])
-        return f"Bot Help: {', '.join(primary_names)} | More: 'help <command>'"
+        # Truncate list to reserve space for suffix when message (and thus max length) is known
+        if message and help_cmd and hasattr(help_cmd, 'get_max_message_length'):
+            max_total = help_cmd.get_max_message_length(message)
+            max_list = max_total - len(self._HELP_PREFIX) - len(self._HELP_SUFFIX)
+            if hasattr(help_cmd, '_format_commands_list_to_length'):
+                list_str = help_cmd._format_commands_list_to_length(primary_names, max_list)
+            else:
+                list_str = ', '.join(primary_names)
+        else:
+            list_str = ', '.join(primary_names)
+        return f"{self._HELP_PREFIX}{list_str}{self._HELP_SUFFIX}"
     
     def get_available_commands_list(self) -> str:
         """Get a formatted list of available commands"""
@@ -1033,6 +1268,55 @@ class CommandManager:
         except Exception as e:
             self.logger.error(f"Failed to send response: {e}")
             return False
+    
+    async def send_response_chunked(
+        self, message: MeshMessage, chunks: List[str], *, skip_user_rate_limit_first: bool = True
+    ) -> bool:
+        """Send multiple response messages (channel or DM) with rate-limit spacing.
+        
+        For channel: delegates to send_channel_messages_chunked. For DM: loops
+        with wait_for_tx + sleep between chunks and send_dm per chunk. First chunk
+        may count against user rate limit depending on skip_user_rate_limit_first;
+        subsequent chunks always skip user rate limit.
+        
+        Args:
+            message: The original message being responded to.
+            chunks: List of message strings to send in order.
+            skip_user_rate_limit_first: If True, skip user rate limit for first chunk too (default).
+            
+        Returns:
+            bool: True if all chunks were sent successfully, False on first failure.
+        """
+        if not chunks:
+            return True
+        rate_limit_key = self.get_rate_limit_key(message)
+        if message.is_dm:
+            rate_limit_seconds = self.bot.config.getfloat('Bot', 'bot_tx_rate_limit_seconds', fallback=1.0)
+            sleep_time = max(rate_limit_seconds + 0.5, 1.0)
+            for i, chunk in enumerate(chunks):
+                if i > 0:
+                    await self.bot.bot_tx_rate_limiter.wait_for_tx()
+                    await asyncio.sleep(sleep_time)
+                skip = skip_user_rate_limit_first if i == 0 else True
+                success = await self.send_dm(
+                    message.sender_id,
+                    chunk,
+                    skip_user_rate_limit=skip,
+                    rate_limit_key=rate_limit_key,
+                )
+                if not success:
+                    self.logger.warning(
+                        "Chunked DM send failed at chunk %d of %d to %s",
+                        i + 1, len(chunks), message.sender_id,
+                    )
+                    return False
+            return True
+        return await self.send_channel_messages_chunked(
+            message.channel,
+            chunks,
+            skip_user_rate_limit=skip_user_rate_limit_first,
+            rate_limit_key=rate_limit_key,
+        )
     
     async def execute_commands(self, message):
         """Execute command objects that handle their own responses.

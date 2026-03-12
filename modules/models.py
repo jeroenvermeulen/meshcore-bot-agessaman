@@ -5,7 +5,7 @@ Contains shared data structures used across modules
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -22,3 +22,5 @@ class MeshMessage:
     snr: Optional[float] = None
     rssi: Optional[int] = None
     elapsed: Optional[str] = None
+    # When set from RF routing: path_nodes, path_hex, bytes_per_hop, path_length, route_type, etc.
+    routing_info: Optional[Dict[str, Any]] = None

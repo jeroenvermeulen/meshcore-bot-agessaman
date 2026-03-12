@@ -130,6 +130,12 @@ auto_manage_contacts = bot
 # Default: meshcore_bot.db
 db_path = meshcore_bot.db
 
+# Local plugins directory (optional)
+# Directory containing commands/, service_plugins/, and optional config.ini.
+# Relative paths are resolved from the bot root; absolute paths used as-is.
+# Default: local (i.e. bot_root/local). Changing this requires a bot restart.
+#local_dir_path = local
+
 # Seconds to wait after a failed service restart before retrying (default: 300)
 service_restart_backoff_seconds = 300
 
@@ -153,6 +159,18 @@ respond_to_dms = true
 # channel_keywords is a global whitelist for channel. Both can be used together.
 # Example: channel_keywords = help,ping,test,hello
 # channel_keywords =
+
+# Set a custom prefix length for the public keys to identify repeaters
+# 1 = 2 hex chars (e.g. 7E), 2 = 4 hex chars (e.g. 7E42). Also used as the mesh
+# graph key length; if the mesh often uses 2-byte paths, set to 2 to avoid
+# conflating distinct links (see Path Command / path-command-config.md).
+prefix_bytes = 1
+
+# Flood scope for channel messages (MeshCore regions; optional)
+# Empty, * or 0: classic flood (default). Set to a region name (e.g. west) to limit
+# channel sends to that scope. Dynamic "reply with same scope as sender" is not
+# supported until the protocol exposes scope on received channel messages.
+# flood_scope =
 
 [Banned_Users]
 # List of banned sender names (comma-separated). Matching is prefix (starts-with):
@@ -209,6 +227,10 @@ admin_commands = repeater,webviewer,reload
 # 
 # Note: The alternative plugin must have the same 'name' metadata as the command
 # it's replacing, or the override will use the alternative plugin's name instead.
+#
+# Local plugins: You can add your own command and service plugins without editing
+# bot code. Put command plugins in local/commands/ and service plugins in
+# local/service_plugins/. Use local/config.ini for their settings. See docs/local-plugins.md.
 
 [Companion_Purge]
 # Enable companion contact purging
@@ -236,6 +258,8 @@ companion_min_inactive_days = 30
 # {rssi} - Received signal strength indicator in dBm
 # {timestamp} - Message timestamp in HH:MM:SS format
 # {path} - Message routing path (e.g., "01,5f (2 hops)")
+# {hops} - Total hop count only (e.g., "2" or "0"); same value as in path/connection_info, for use without the path string
+# {hops_label} - Same as hops with word "hop"/"hops" and pluralization (e.g., "1 hop", "2 hops", or "?" when unknown)
 # {path_distance} - Total distance between all hops in path with locations (e.g., "123.4km (3 segs, 1 no-loc)")
 # {firstlast_distance} - Distance between first and last repeater in path (e.g., "45.6km" or empty if locations missing)
 # {elapsed} - Elapsed time (e.g. 1234ms) or "Sync Device Clock" when device clock is invalid (use {elapsed} only; do not append ms)
@@ -280,10 +304,32 @@ companion_min_inactive_days = 30
 test = "ack @[{sender}]{phrase_part} | {connection_info} | Received at: {timestamp}"
 ping = "Pong!"
 pong = "Ping!"
-help = "Bot Help: test (or t), ping, help, hello, cmd, advert, wx, aqi, sun, moon, solar, hfcond, satpass, prefix, path, sports, dice, roll, stats | More: 'help <command>'"
+# Override 'help' command output
+# help = "Bot Help: test (or t), ping, help, hello, cmd, advert, wx, aqi, sun, moon, solar, hfcond, satpass, prefix, path, sports, dice, roll, stats | More: 'help <command>'"
 
 # Override 'cmd' command output
 # cmd = "Available commands: test (or t), ping, help, hello, cmd, advert, wx, aqi, sun, moon, solar, hfcond, satpass, prefix, path, sports, dice, roll, stats"
+
+[RandomLine]
+# Configurable command to act on a trigger word and respond with a random line from its file
+# triggers.<key> = csv list of trigger words
+# file.<key> = path to text file
+# prefix.<key> = string prepended to the chosen line (often an emoji)
+# channel.<key> or channels.<key> = comma-separated channel names; if set, trigger only works in those channels (e.g. channel.momjoke = #jokes)
+
+# default prefix (blank = no prefix)
+prefix.default =
+
+# Mom Jokes (only in #jokes)
+triggers.momjoke = momjoke,momjokes,mom joke,mom jokes,mom-joke,mom-jokes
+file.momjoke = data/randomlines/momjokes.txt
+prefix.momjoke = 🥸
+# channel.momjoke = #jokes
+
+# Fun Facts
+triggers.funfact = funfact,funfacts,fun fact,fun facts,fun-fact,fun-facts
+file.funfact = data/randomlines/funfacts.txt
+prefix.funfact = 💡
 
 [Scheduled_Messages]
 # Scheduled message format: HHMM = channel:message
@@ -343,6 +389,7 @@ log_level = INFO
 
 # Log file path (leave empty for console only)
 # Bot will write logs to this file in addition to console
+# Logs rotate at 5 MB with up to 3 backup files (e.g. meshcore_bot.log.1, .2, .3)
 log_file = meshcore_bot.log
 
 # Enable colored console output
@@ -629,6 +676,25 @@ track_command_details = true
 # true: Replace user IDs with anonymous identifiers
 # false: Keep actual user IDs in stats
 anonymize_users = false
+
+[Data_Retention]
+# Data retention controls how long the bot keeps data in the database.
+# The scheduler runs cleanup daily so retention is enforced even when the
+# standalone web viewer is not running. Shorter retention reduces DB size.
+#
+# Packet stream (web viewer real-time display and transmission_tracker)
+# 2-3 days is enough for most deployments; 7 days if you need longer history.
+packet_stream_retention_days = 3
+#
+# Repeater/stats tables: daily_stats, unique_advert_packets, observed_paths
+daily_stats_retention_days = 90
+observed_paths_retention_days = 90
+#
+# Purging log (audit trail for repeater purges)
+purging_log_retention_days = 90
+#
+# Mesh connections (path graph edges). Should be >= Path_Command graph_edge_expiration_days.
+mesh_connections_retention_days = 7
 
 [Path_Command]
 # Enable or disable the path command
@@ -1135,6 +1201,30 @@ enabled = true
 enabled = true
 # channels =
 
+[Trace_Command]
+# Enable or disable the trace/tracer commands (link diagnostics)
+enabled = true
+# Maximum path length (hops) for manual or reciprocal path; paths longer than this are capped
+maximum_hops = 5
+# Trace mode: one_byte (default) or two_byte (when firmware supports it)
+trace_mode = one_byte
+# Timeout: total = timeout_base_seconds + (path hops * timeout_per_hop_seconds); typical 6 hops ~1s, 10 ~2s
+timeout_base_seconds = 1.0
+timeout_per_hop_seconds = 0.5
+# Retries: max attempts (default 2 = try once, then once more after delay)
+trace_retry_count = 2
+# Seconds to wait before retrying a failed trace
+trace_retry_delay_seconds = 1.0
+# Update mesh graph with bidirectional link when 1-byte trace succeeds
+update_graph_one_byte = true
+# Update mesh graph with 2-byte link identification when 2-byte trace succeeds (when supported)
+update_graph_two_byte = true
+# Optional: single emoji or string for bot in trace output; if unset, uses [Bot]
+# bot_label = 🤖
+# Output format: inline (default) or vertical
+# output_format = inline
+# channels =
+
 [Feed_Command]
 enabled = false
 # channels =
@@ -1251,8 +1341,8 @@ auth_token_method = device
 # Location Code (IATA code for your location)
 # Used in topic templates and auth tokens
 # Example: SEA, LAX, JFK, etc.
-# Default: LOC (if not set)
-iata = LOC
+# Default: XYZ (invalid if not set)
+iata = XYZ
 
 # MQTT configuration
 # Enable MQTT publishing
@@ -1406,6 +1496,39 @@ blitz_collection_interval = 600000
 # blitz_area_max_lat = 48.76
 # blitz_area_max_lon = 18.62
 
+[Earthquake_Service]
+# Enable earthquake alert service (true/false)
+# Polls USGS Earthquake API and posts alerts to a channel when quakes occur in the configured region
+enabled = false
+
+# Channel to post earthquake alerts to
+channel = #general
+
+# Poll interval (milliseconds). How often to check USGS for new earthquakes
+# Default: 60000 (1 minute)
+poll_interval = 60000
+
+# Time window (minutes). Only earthquakes in the last N minutes are queried
+# Default: 10
+time_window_minutes = 10
+
+# Minimum magnitude to report (e.g. 3.0 for M3.0+)
+# Default: 3.0
+min_magnitude = 3.0
+
+# Region bounding box (decimal degrees). Defaults are California
+# Southern and northern latitude bounds
+minlatitude = 32.5
+maxlatitude = 42.0
+# Western and eastern longitude bounds (negative = West)
+minlongitude = -124.5
+maxlongitude = -114.0
+
+# Send USGS event link in a separate message following the alert (true/false)
+# When true: notification message then link-only message. When false: no link sent.
+# Default: true
+send_link = true
+
 [DiscordBridge]
 # Enable Discord bridge service
 # Enable Discord bridge (true/false). One-way, read-only webhooks
@@ -1433,6 +1556,13 @@ enabled = false
 # Default: color
 avatar_style = color
 
+# Profanity handling for bridged message content and usernames: drop (default), censor, or off
+# drop = do not bridge messages that contain profanity; censor = replace with **** and bridge; off = no filtering
+# filter_profanity = drop
+
+# Bridge the bot's own channel responses (e.g. command replies) to Discord. true (default) = bridge; false = only bridge other users' messages
+# bridge_bot_responses = true
+
 # Channel mappings: bridge.<meshcore_channel> = <discord_webhook_url>
 # Only channels explicitly listed here will be bridged to Discord
 # Get webhook URLs from Discord: Channel Settings → Integrations → Webhooks → Create Webhook
@@ -1446,3 +1576,60 @@ avatar_style = color
 # bridge.general = https://discord.com/api/webhooks/123456789012345678/abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJKLMNOPQRST
 # bridge.emergency = https://discord.com/api/webhooks/987654321098765432/ZYXWVUTSRQPONMLKJIHGFEDCBA0987654321zyxwvutsrqponmlkjihgf
 # bridge.wx = https://discord.com/api/webhooks/111222333444555666/WeatherChannelWebhookTokenGoesHere1234567890abcdefghijklmno
+
+[TelegramBridge]
+# Enable Telegram bridge service
+# Posts MeshCore channel messages to Telegram via the Bot API (one-way, read-only)
+# true: Enable Telegram bridge
+# false: Telegram bridge disabled (default)
+enabled = false
+
+# IMPORTANT: Direct messages (DMs) are NEVER bridged to Telegram (hardcoded for privacy)
+
+# Bot API token from @BotFather. Can also be set via TELEGRAM_BOT_TOKEN env var (env takes precedence).
+# Rotate token in @BotFather if it was ever exposed.
+# api_token = YOUR_BOT_TOKEN_HERE
+
+# Optional: parse_mode for message formatting (HTML, Markdown, or MarkdownV2). Default: HTML
+# parse_mode = HTML
+
+# Optional: disable link previews in bridged messages (true/false). Default: false
+# disable_web_page_preview = false
+
+# Optional: max message length (1-4096). Telegram limit is 4096. Default: 4096
+# max_message_length = 4096
+
+# Profanity handling for bridged message content and usernames: drop (default), censor, or off
+# drop = do not bridge messages that contain profanity; censor = replace with **** and bridge; off = no filtering
+# filter_profanity = drop
+
+# Bridge the bot's own channel responses (e.g. command replies) to Telegram. true (default) = bridge; false = only bridge other users' messages
+# bridge_bot_responses = true
+
+# Channel mappings: bridge.<meshcore_channel> = <telegram_chat_id>
+# chat_id: @channelusername for public channels, or numeric ID (e.g. -100xxxxxxxxxx) for private
+# Add bot to channel as Administrator with "Post Messages" permission
+# See docs/telegram-bridge.md for setup
+# bridge.Public = @YourChannelName
+# bridge.emergency = -1001234567890
+
+# -----------------------------------------------------------------------------
+# Check-in service (local plugin: local/service_plugins/checkin_service.py)
+# Put [CheckIn] in local/config.ini to keep main config clean. See docs/checkin-api.md for API contract.
+# -----------------------------------------------------------------------------
+# [CheckIn]
+# enabled = true
+# Channel to collect check-ins from (default: #meshmonday)
+# channel = #meshmonday
+# When to collect: monday (only Mondays) or daily
+# check_in_days = monday
+# If any_message_counts = true, any message in the channel counts as a check-in.
+# If false, only messages containing require_phrase (case-insensitive) count.
+# any_message_counts = false
+# require_phrase = check in
+# Time of day to flush collected check-ins and submit to API (HH:MM or HHMM). Uses [Bot] timezone.
+# flush_time = 23:59
+# Optional: submit check-ins to a web API (POST). If set, api_key or CHECKIN_API_KEY env is required.
+# api_url = https://example.com/checkins
+# api_key = YOUR_API_KEY
+# Or set CHECKIN_API_KEY in the environment (takes precedence).

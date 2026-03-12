@@ -5,7 +5,7 @@ This guide explains how to install the MeshCore Bot as a systemd service on Linu
 ## Prerequisites
 
 - Linux system with systemd
-- Python 3.7+
+- Python 3.7+ (Python 3.12+ recommended; on 3.11 the meshcore dependency has an f-string bug — the install script patches it automatically)
 - Root/sudo access
 - MeshCore-compatible device
 
@@ -143,6 +143,16 @@ sudo systemctl restart meshcore-bot
 2. View logs: `sudo journalctl -u meshcore-bot -n 50`
 3. Check configuration: `sudo nano /opt/meshcore-bot/config.ini`
 4. Verify dependencies: `sudo pip3 list | grep meshcore`
+
+### SyntaxError: f-string: unmatched '[' (Python 3.11)
+If the bot fails on import with this error in `meshcore/commands/contact.py`, you are on Python 3.11 and the **meshcore** dependency uses an f-string that only works on Python 3.12+.
+
+**Options:**
+- **Recommended:** Use Python 3.12+ (create the venv with `python3.12` if available, then re-run `./install-service.sh --upgrade`).
+- **Or:** Re-run the install script so it can patch the installed package:  
+  `sudo ./install-service.sh --upgrade`  
+  The script detects Python 3.11 and patches the meshcore file in the venv.
+- **Manual patch:** Edit `/opt/meshcore-bot/venv/lib/python3.11/site-packages/meshcore/commands/contact.py`, find the line containing `contact["adv_name"]` inside the f-string, and change it to `contact['adv_name']` (single quotes around `adv_name`).
 
 ### Permission Issues
 1. Check file ownership: `ls -la /opt/meshcore-bot/`

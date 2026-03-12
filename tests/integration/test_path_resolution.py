@@ -5,6 +5,7 @@ Integration tests for full path resolution
 
 import pytest
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta
 from modules.commands.path_command import PathCommand
 from modules.mesh_graph import MeshGraph
@@ -23,7 +24,7 @@ class TestPathResolutionIntegration:
         repeater3 = create_test_repeater('86', 'Repeater 86', latitude=47.6200, longitude=-122.3500)
         
         # Insert into database
-        with sqlite3.connect(test_db.db_path) as conn:
+        with closing(sqlite3.connect(test_db.db_path)) as conn:
             cursor = conn.cursor()
             for r in [repeater1, repeater2, repeater3]:
                 cursor.execute('''
@@ -63,7 +64,7 @@ class TestPathResolutionIntegration:
         mesh_graph.add_edge('01', '7e', to_public_key=key1)
         
         # Insert into database
-        with sqlite3.connect(test_db.db_path) as conn:
+        with closing(sqlite3.connect(test_db.db_path)) as conn:
             cursor = conn.cursor()
             for r in [repeater1, repeater2]:
                 cursor.execute('''
@@ -89,7 +90,7 @@ class TestPathResolutionIntegration:
         graph1.add_edge('01', '7e', from_public_key='01' * 32, to_public_key='7e' * 32)
         
         # Verify edge in database
-        with sqlite3.connect(test_db.db_path) as conn:
+        with closing(sqlite3.connect(test_db.db_path)) as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT * FROM mesh_connections WHERE from_prefix = ? AND to_prefix = ?', ('01', '7e'))
             row = cursor.fetchone()
@@ -120,7 +121,7 @@ class TestPathResolutionIntegration:
         populated_mesh_graph.add_edge('01', '7e', to_public_key=key2)
         
         # Insert into database
-        with sqlite3.connect(test_db.db_path) as conn:
+        with closing(sqlite3.connect(test_db.db_path)) as conn:
             cursor = conn.cursor()
             for r in [repeater1, repeater2]:
                 cursor.execute('''
@@ -157,7 +158,7 @@ class TestPathResolutionIntegration:
             repeaters.append(repeater)
         
         # Insert into database
-        with sqlite3.connect(test_db.db_path) as conn:
+        with closing(sqlite3.connect(test_db.db_path)) as conn:
             cursor = conn.cursor()
             for r in repeaters:
                 cursor.execute('''

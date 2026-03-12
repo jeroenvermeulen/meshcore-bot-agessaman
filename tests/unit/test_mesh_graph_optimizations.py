@@ -13,6 +13,7 @@ Covers the optimizations added for low-memory devices (Raspberry Pi Zero 2 W):
 import time
 import sqlite3
 import pytest
+from contextlib import closing
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -218,7 +219,7 @@ class TestEdgeExpiration:
         expired_ts = (datetime.now() - timedelta(days=30)).isoformat()
         fresh_ts = datetime.now().isoformat()
 
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             conn.execute(
                 '''INSERT INTO mesh_connections
                    (from_prefix, to_prefix, observation_count, first_seen, last_seen)

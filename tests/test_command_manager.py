@@ -4,6 +4,7 @@ import time
 
 import pytest
 from configparser import ConfigParser
+from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch, AsyncMock
 
 from modules.command_manager import CommandManager, InternetStatusCache
@@ -16,6 +17,8 @@ def cm_bot(mock_logger):
     """Mock bot for CommandManager tests."""
     bot = Mock()
     bot.logger = mock_logger
+    bot.bot_root = Path("/tmp")
+    bot._local_root = None  # Use bot_root / local / commands in CommandManager
     bot.config = ConfigParser()
     bot.config.add_section("Bot")
     bot.config.set("Bot", "bot_name", "TestBot")
@@ -278,3 +281,171 @@ class TestInternetStatusCache:
         lock1 = cache._get_lock()
         lock2 = cache._get_lock()
         assert lock1 is lock2
+
+
+class TestSendChannelMessageListeners:
+    """Tests for channel_sent_listeners invocation when bot sends a channel message."""
+
+    @pytest.mark.asyncio
+    async def test_successful_send_invokes_listeners_with_synthetic_event(self, cm_bot, mock_logger):
+        """When send_channel_message succeeds, each channel_sent_listener is called with event.payload shape (channel_idx, text)."""
+        import asyncio
+        from meshcore import EventType
+
+        cm_bot.connected = True
+        cm_bot.channel_manager = Mock()
+        cm_bot.channel_manager.get_channel_number = Mock(return_value=3)
+        cm_bot.meshcore = Mock()
+        cm_bot.meshcore.commands = Mock()
+        cm_bot.meshcore.commands.send_chan_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        cm_bot.channel_sent_listeners = []
+        received = []
+
+        async def capture_listener(event, metadata=None):
+            received.append(getattr(event, 'payload', None))
+
+        cm_bot.channel_sent_listeners.append(capture_listener)
+
+        created_tasks = []
+
+        with patch("modules.command_manager.asyncio.create_task") as mock_create_task:
+            def capture_and_run(coro):
+                t = asyncio.get_event_loop().create_task(coro)
+                created_tasks.append(t)
+                return t
+
+            mock_create_task.side_effect = capture_and_run
+
+            manager = make_manager(cm_bot)
+            result = await manager.send_channel_message("general", "Hello mesh")
+
+            for t in created_tasks:
+                await t
+
+        assert result is True
+        assert len(received) == 1
+        assert received[0] == {"channel_idx": 3, "text": "TestBot: Hello mesh"}
+
+    @pytest.mark.asyncio
+    async def test_failed_send_does_not_invoke_listeners(self, cm_bot):
+        """When send_channel_message fails (e.g. channel not found), listeners are not called."""
+        cm_bot.connected = True
+        cm_bot.channel_manager = Mock()
+        cm_bot.channel_manager.get_channel_number = Mock(return_value=None)
+        cm_bot.channel_sent_listeners = []
+        received = []
+
+        async def capture_listener(event, metadata=None):
+            received.append(getattr(event, 'payload', None))
+
+        cm_bot.channel_sent_listeners.append(capture_listener)
+
+        manager = make_manager(cm_bot)
+        result = await manager.send_channel_message("nonexistent", "Hi")
+
+        assert result is False
+        assert len(received) == 0
+
+    @pytest.mark.asyncio
+    async def test_no_listeners_no_error(self, cm_bot):
+        """When channel_sent_listeners is missing or empty, send_channel_message still returns success."""
+        from meshcore import EventType
+
+        cm_bot.connected = True
+        cm_bot.channel_manager = Mock()
+        cm_bot.channel_manager.get_channel_number = Mock(return_value=1)
+        cm_bot.meshcore = Mock()
+        cm_bot.meshcore.commands = Mock()
+        cm_bot.meshcore.commands.send_chan_msg = AsyncMock(return_value=Mock(type=EventType.MSG_SENT, payload=None))
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+        cm_bot.channel_sent_listeners = []
+
+        manager = make_manager(cm_bot)
+        result = await manager.send_channel_message("general", "Hi")
+
+        assert result is True
+
+
+class TestSendChannelMessagesChunked:
+    """Tests for send_channel_messages_chunked."""
+
+    @pytest.mark.asyncio
+    async def test_empty_chunks_returns_true_without_send(self, cm_bot):
+        """Empty chunks returns True and does not call send_channel_message."""
+        manager = make_manager(cm_bot)
+        manager.send_channel_message = AsyncMock(return_value=True)
+        result = await manager.send_channel_messages_chunked("general", [])
+        assert result is True
+        manager.send_channel_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_single_chunk_calls_send_once_no_wait(self, cm_bot):
+        """Single chunk calls send_channel_message once; no wait_for_tx or sleep."""
+        cm_bot.config.set("Bot", "bot_tx_rate_limit_seconds", "1.0")
+        manager = make_manager(cm_bot)
+        manager.send_channel_message = AsyncMock(return_value=True)
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+
+        with patch("modules.command_manager.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await manager.send_channel_messages_chunked("general", ["only one"])
+
+        assert result is True
+        assert manager.send_channel_message.call_count == 1
+        cm_bot.bot_tx_rate_limiter.wait_for_tx.assert_not_called()
+        mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_multiple_chunks_waits_and_sleeps_between(self, cm_bot):
+        """Multiple chunks call send_channel_message per chunk; wait_for_tx and sleep between."""
+        cm_bot.config.set("Bot", "bot_tx_rate_limit_seconds", "1.0")
+        manager = make_manager(cm_bot)
+        manager.send_channel_message = AsyncMock(return_value=True)
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+
+        with patch("modules.command_manager.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await manager.send_channel_messages_chunked("general", ["a", "b", "c"])
+
+        assert result is True
+        assert manager.send_channel_message.call_count == 3
+        assert cm_bot.bot_tx_rate_limiter.wait_for_tx.call_count == 2
+        assert mock_sleep.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_chunked_first_uses_provided_rate_limit_args_subsequent_skip(self, cm_bot):
+        """First chunk uses provided skip_user_rate_limit/rate_limit_key; subsequent use True/None."""
+        cm_bot.config.set("Bot", "bot_tx_rate_limit_seconds", "1.0")
+        manager = make_manager(cm_bot)
+        manager.send_channel_message = AsyncMock(return_value=True)
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+
+        with patch("modules.command_manager.asyncio.sleep", new_callable=AsyncMock):
+            await manager.send_channel_messages_chunked(
+                "general",
+                ["first", "second"],
+                skip_user_rate_limit=False,
+                rate_limit_key="user123",
+            )
+
+        calls = manager.send_channel_message.call_args_list
+        assert len(calls) == 2
+        # First call: skip_user_rate_limit=False, rate_limit_key="user123"
+        assert calls[0][1]["skip_user_rate_limit"] is False
+        assert calls[0][1]["rate_limit_key"] == "user123"
+        # Second call: skip_user_rate_limit=True, rate_limit_key=None
+        assert calls[1][1]["skip_user_rate_limit"] is True
+        assert calls[1][1]["rate_limit_key"] is None
+
+    @pytest.mark.asyncio
+    async def test_chunked_returns_false_on_first_send_failure(self, cm_bot):
+        """When first send_channel_message returns False, chunked returns False and does not send rest."""
+        cm_bot.config.set("Bot", "bot_tx_rate_limit_seconds", "1.0")
+        manager = make_manager(cm_bot)
+        manager.send_channel_message = AsyncMock(side_effect=[False, True])  # first fails
+        cm_bot.bot_tx_rate_limiter.wait_for_tx = AsyncMock(return_value=None)
+
+        with patch("modules.command_manager.asyncio.sleep", new_callable=AsyncMock):
+            result = await manager.send_channel_messages_chunked("general", ["a", "b"])
+
+        assert result is False
+        manager.send_channel_message.assert_called_once()

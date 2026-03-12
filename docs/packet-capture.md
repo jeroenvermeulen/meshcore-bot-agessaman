@@ -16,8 +16,8 @@ enabled = true
 owner_public_key = YOUR_COMPANION_PUBLIC_KEY_HERE
 owner_email = your.email@example.com
 
-# IATA code for topic routing
-iata = LOC
+# IATA code for topic routing (XYZ is invalid set it to a real IATA)
+iata = XYZ
 
 # MQTT Broker (Let's Mesh Analyzer)
 mqtt1_enabled = true

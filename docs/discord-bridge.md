@@ -80,6 +80,15 @@ Control how user avatars appear in Discord:
 
 Preview: `https://api.dicebear.com/7.x/{style}/png?seed=YourName`
 
+### Profanity filter
+
+- **`filter_profanity`** (optional): How to handle profanity in bridged message content and usernames.
+  - **drop** (default): Do not bridge messages that contain profanity (message is dropped).
+  - **censor**: Replace profanity with `****` and bridge the message.
+  - **off**: No filtering; bridge all messages as-is.
+- The filter checks word-based profanity (via `better-profanity` and optional `unidecode` for homoglyphs) and blocked hate symbols (e.g. swastika Unicode 卐/卍). Symbols are replaced with `***`.
+- Requires the `better-profanity` package (see `requirements.txt`). If the package is not installed and `filter_profanity` is `drop` or `censor`, a warning is logged and messages are bridged without word filtering; hate symbols are still filtered even without the package.
+
 ---
 
 ## Security & Privacy

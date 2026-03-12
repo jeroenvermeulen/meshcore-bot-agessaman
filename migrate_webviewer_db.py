@@ -15,6 +15,7 @@ Example:
 
 import sqlite3
 import sys
+from contextlib import closing
 
 
 def main() -> int:
@@ -31,48 +32,46 @@ def main() -> int:
         return 1
 
     try:
-        conn = sqlite3.connect(target_path, timeout=30.0)
-        conn.execute("ATTACH DATABASE ? AS src", (source_path,))
+        with closing(sqlite3.connect(target_path, timeout=30.0)) as conn:
+            conn.execute("ATTACH DATABASE ? AS src", (source_path,))
 
-        # Ensure packet_stream exists in target (same schema as web viewer)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS packet_stream (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                data TEXT NOT NULL,
-                type TEXT NOT NULL
+            # Ensure packet_stream exists in target (same schema as web viewer)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS packet_stream (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp REAL NOT NULL,
+                    data TEXT NOT NULL,
+                    type TEXT NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_packet_stream_timestamp ON packet_stream(timestamp)"
             )
-        """)
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_packet_stream_timestamp ON packet_stream(timestamp)"
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_packet_stream_type ON packet_stream(type)"
-        )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_packet_stream_type ON packet_stream(type)"
+            )
 
-        # Check that source has packet_stream
-        cur = conn.execute(
-            "SELECT name FROM src.sqlite_master WHERE type='table' AND name='packet_stream'"
-        )
-        if cur.fetchone() is None:
+            # Check that source has packet_stream
+            cur = conn.execute(
+                "SELECT name FROM src.sqlite_master WHERE type='table' AND name='packet_stream'"
+            )
+            if cur.fetchone() is None:
+                conn.execute("DETACH DATABASE src")
+                print(f"Source database has no packet_stream table; nothing to migrate.", file=sys.stderr)
+                return 0
+
+            # Copy rows from source; skip ids that already exist in target (INSERT OR IGNORE)
+            before = conn.total_changes
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO main.packet_stream (id, timestamp, data, type)
+                SELECT id, timestamp, data, type FROM src.packet_stream
+                """
+            )
+            inserted = conn.total_changes - before
+            conn.commit()
+
             conn.execute("DETACH DATABASE src")
-            conn.close()
-            print(f"Source database has no packet_stream table; nothing to migrate.", file=sys.stderr)
-            return 0
-
-        # Copy rows from source; skip ids that already exist in target (INSERT OR IGNORE)
-        before = conn.total_changes
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO main.packet_stream (id, timestamp, data, type)
-            SELECT id, timestamp, data, type FROM src.packet_stream
-            """
-        )
-        inserted = conn.total_changes - before
-        conn.commit()
-
-        conn.execute("DETACH DATABASE src")
-        conn.close()
 
         print(f"Migrated {inserted} packet_stream row(s) from {source_path} to {target_path}.")
         return 0

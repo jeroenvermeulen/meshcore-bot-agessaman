@@ -14,6 +14,7 @@ import argparse
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict
+from contextlib import closing
 
 # Import bot modules with error handling
 try:
@@ -1023,7 +1024,7 @@ def get_command_popularity(db_path: Optional[str], commands: Dict[str, Any]) -> 
         return popularity
     
     try:
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             cursor = conn.cursor()
             
             # Check if command_stats table exists

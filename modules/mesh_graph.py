@@ -3,6 +3,19 @@
 Mesh Graph Module
 Tracks observed connections between repeaters to improve path guessing accuracy.
 Persists graph state across bot restarts for development scenarios.
+
+Multi-resolution storage and node identity:
+  Edges are stored at the resolution observed (2, 4, or 6 hex chars per node). Nodes
+  with the same logical identity (e.g. 01, 0101, 0101C1) are treated as one: on read,
+  get_edge uses prefix matching and returns the best-matching edge (longest prefix,
+  then observation_count, then last_seen). On write:
+  - 1-byte observations (2-char prefix): merge into an existing 2/3-byte edge only
+    when the edge is unique (exactly one prefix-matching edge). If zero or multiple
+    matches exist, create or update only the 1-byte edge to avoid false coalescing.
+  - 2/3-byte observations: merge into the best-matching edge when present; when the
+    new observation is more specific than the existing edge, promote (remove old edge,
+    add new at higher resolution with merged observation count; DB: delete old row,
+    insert new). Distinct links (e.g. 7e42→8611 and 7e99→86ff) stay separate.
 """
 
 import sqlite3
@@ -66,6 +79,138 @@ class MeshGraph:
         if self.capture_enabled and self.write_strategy in ('batched', 'hybrid'):
             self._start_batch_writer()
     
+    def _prefix_len(self) -> int:
+        """Return configured prefix length in hex chars (always an int for slicing)."""
+        n = getattr(self.bot, 'prefix_hex_chars', 2)
+        try:
+            return max(2, int(n))
+        except (TypeError, ValueError):
+            return 2
+
+    def _valid_prefix_length(self, prefix: str) -> bool:
+        """Return True if prefix has 2, 4, or 6 hex chars (after stripping)."""
+        if not prefix or not isinstance(prefix, str):
+            return False
+        s = prefix.strip().lower()
+        if len(s) not in (2, 4, 6):
+            return False
+        return all(c in '0123456789abcdef' for c in s)
+
+    def _prefix_match(self, a: str, b: str) -> bool:
+        """Return True if a and b match: exact or one is a prefix of the other (after lowercasing)."""
+        if not a or not b:
+            return False
+        a, b = a.lower().strip(), b.lower().strip()
+        return a == b or a.startswith(b) or b.startswith(a)
+
+    def _get_edge_by_prefix_match(self, from_q: str, to_q: str) -> Optional[Dict]:
+        """Return the best matching edge for a prefix query. Single edge only; never merge counts.
+        Tie-break: exact key if present, else longest combined prefix length, then max
+        observation_count, then most recent last_seen.
+        """
+        matches = self._find_all_matching_edges(from_q, to_q)
+        if not matches:
+            return None
+        # Return the edge data of the best match (first in list)
+        return matches[0][1]
+
+    def _find_all_matching_edges(
+        self, from_prefix: str, to_prefix: str
+    ) -> List[Tuple[Tuple[str, str], Dict]]:
+        """Return all edges that prefix-match (from_prefix, to_prefix), ordered by best match first.
+
+        Best = longest combined prefix length, then observation_count desc, then last_seen desc.
+        Used for 1-byte uniqueness check (merge only when len==1) and for 2/3-byte merge/promote.
+        """
+        from_q = from_prefix.lower().strip() if from_prefix else ""
+        to_q = to_prefix.lower().strip() if to_prefix else ""
+        if not from_q or not to_q:
+            return []
+
+        candidates: List[Tuple[Tuple[str, str], Dict]] = []
+        for edge_key, edge in self.edges.items():
+            from_p, to_p = edge_key
+            if self._prefix_match(from_p, from_q) and self._prefix_match(to_p, to_q):
+                candidates.append((edge_key, edge))
+
+        if not candidates:
+            return []
+
+        def sort_key(item):
+            edge_key, edge = item
+            from_p, to_p = edge_key
+            spec = len(from_p) + len(to_p)
+            obs = edge.get("observation_count", 0)
+            last = edge.get("last_seen")
+            if isinstance(last, str):
+                try:
+                    last = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                except ValueError:
+                    last = datetime.min
+            last_ts = last if isinstance(last, datetime) else datetime.min
+            return (-spec, -obs, last_ts)  # desc spec, desc obs, asc time -> most recent last
+
+        candidates.sort(key=sort_key)
+        return candidates
+
+    def _remove_edge_from_memory(self, edge_key: Tuple[str, str]) -> None:
+        """Remove an edge from in-memory graph and adjacency indexes.
+        Does not touch the database. Used when promoting to a higher-resolution key.
+        """
+        if edge_key not in self.edges:
+            return
+        from_p, to_p = edge_key
+        del self.edges[edge_key]
+        if from_p in self._outgoing_index:
+            self._outgoing_index[from_p].discard(to_p)
+            if not self._outgoing_index[from_p]:
+                del self._outgoing_index[from_p]
+        if to_p in self._incoming_index:
+            self._incoming_index[to_p].discard(from_p)
+            if not self._incoming_index[to_p]:
+                del self._incoming_index[to_p]
+        self._notification_timestamps.pop(edge_key, None)
+
+    def _delete_edge_from_db(
+        self, edge_key: Tuple[str, str], conn: Optional[sqlite3.Connection] = None
+    ) -> int:
+        """Delete a single edge row from mesh_connections. Returns rows affected."""
+        from_p, to_p = edge_key
+        query = "DELETE FROM mesh_connections WHERE from_prefix = ? AND to_prefix = ?"
+        params = (from_p, to_p)
+        if conn is not None:
+            return self.db_manager.execute_update_on_connection(conn, query, params)
+        return self.db_manager.execute_update(query, params)
+
+    def _update_edge_data(
+        self,
+        edge: Dict,
+        now: datetime,
+        hop_position: Optional[int] = None,
+        from_public_key: Optional[str] = None,
+        to_public_key: Optional[str] = None,
+        geographic_distance: Optional[float] = None,
+        prefix_bytes: int = 1,
+    ) -> None:
+        """Apply one observation to an edge dict (increment count, last_seen, optional fields)."""
+        edge["observation_count"] = edge.get("observation_count", 0) + 1
+        edge["last_seen"] = now
+        if hop_position is not None:
+            current_avg = edge.get("avg_hop_position")
+            count = edge["observation_count"]
+            if current_avg is not None:
+                edge["avg_hop_position"] = ((current_avg * (count - 1)) + hop_position) / count
+            else:
+                edge["avg_hop_position"] = hop_position
+        if from_public_key:
+            edge["from_public_key"] = from_public_key
+        if to_public_key:
+            edge["to_public_key"] = to_public_key
+        if geographic_distance is not None:
+            edge["geographic_distance"] = geographic_distance
+        if prefix_bytes == 2:
+            edge["confirmed_2byte"] = True
+
     def _load_from_database(self):
         """Load graph edges from database on startup."""
         try:
@@ -143,20 +288,26 @@ class MeshGraph:
             self.logger.warning(f"Error loading graph from database: {e}")
             # Continue with empty graph
     
-    def add_edge(self, from_prefix: str, to_prefix: str, 
+    def add_edge(self, from_prefix: str, to_prefix: str,
                  from_public_key: Optional[str] = None,
                  to_public_key: Optional[str] = None,
                  hop_position: Optional[int] = None,
-                 geographic_distance: Optional[float] = None):
+                 geographic_distance: Optional[float] = None,
+                 prefix_bytes: int = 1):
         """Add or update an edge in the graph.
-        
+
+        Prefixes are stored at the resolution provided (2, 4, or 6 hex chars).
+        No truncation; the same physical link can be recorded at different
+        resolutions and will create/update the matching edge.
+
         Args:
-            from_prefix: Source node prefix (2 hex chars).
-            to_prefix: Destination node prefix (2 hex chars).
+            from_prefix: Source node prefix (2, 4, or 6 hex chars depending on path encoding).
+            to_prefix: Destination node prefix (2, 4, or 6 hex chars depending on path encoding).
             from_public_key: Full public key of source node (optional).
             to_public_key: Full public key of destination node (optional).
             hop_position: Position in path where this edge was observed (optional).
             geographic_distance: Distance in km between nodes (optional).
+            prefix_bytes: 1 = 1-byte (2-char) prefix (default); 2 = 2-byte confirmed (stored as edge flag for weighting).
         """
         if not from_prefix or not to_prefix:
             return
@@ -165,9 +316,11 @@ class MeshGraph:
         if not self.capture_enabled:
             return
 
-        # Normalize prefixes to lowercase
-        from_prefix = from_prefix.lower()[:2]
-        to_prefix = to_prefix.lower()[:2]
+        # Normalize to lowercase; validate length (2, 4, or 6 hex chars). No truncation.
+        from_prefix = from_prefix.lower().strip()
+        to_prefix = to_prefix.lower().strip()
+        if not self._valid_prefix_length(from_prefix) or not self._valid_prefix_length(to_prefix):
+            return
 
         # Intern public key strings so repeated identical keys share one object in RAM
         if from_public_key:
@@ -178,7 +331,83 @@ class MeshGraph:
         edge_key = (from_prefix, to_prefix)
         now = datetime.now()
 
-        # Update or create edge
+        matches = self._find_all_matching_edges(from_prefix, to_prefix)
+        best = matches[0] if matches else None
+        incoming_1byte = len(from_prefix) == 2 or len(to_prefix) == 2
+
+        # 1-byte: merge only when exactly one matching edge (unique link)
+        if incoming_1byte and len(matches) == 1:
+            target_key, target_edge = matches[0]
+            self._update_edge_data(
+                target_edge, now, hop_position,
+                from_public_key, to_public_key, geographic_distance, prefix_bytes,
+            )
+            self._persist_and_notify_edge(target_key, is_new_edge=False)
+            return
+
+        # 2/3-byte: merge into best match or promote
+        if not incoming_1byte and best is not None:
+            best_key, best_edge = best
+            best_spec = len(best_key[0]) + len(best_key[1])
+            new_spec = len(from_prefix) + len(to_prefix)
+
+            if best_key == edge_key:
+                # Update in place
+                self._update_edge_data(
+                    best_edge, now, hop_position,
+                    from_public_key, to_public_key, geographic_distance, prefix_bytes,
+                )
+                self._persist_and_notify_edge(edge_key, is_new_edge=False)
+                return
+
+            if best_spec > new_spec:
+                # Best match is more specific — update that edge and return
+                self._update_edge_data(
+                    best_edge, now, hop_position,
+                    from_public_key, to_public_key, geographic_distance, prefix_bytes,
+                )
+                self._persist_and_notify_edge(best_key, is_new_edge=False)
+                return
+
+            if best_spec < new_spec:
+                # Don't promote 1-byte to 3-byte when the existing 1-byte edge has no public_key:
+                # keep the 1-byte edge so we don't attribute its observations to one specific 3-byte node
+                # (other e0 repeaters would otherwise have no edges and appear removed).
+                best_is_1byte = len(best_key[0]) == 2 and len(best_key[1]) == 2
+                if best_is_1byte and not best_edge.get("from_public_key") and not best_edge.get("to_public_key"):
+                    self._update_edge_data(
+                        best_edge, now, hop_position,
+                        from_public_key, to_public_key, geographic_distance, prefix_bytes,
+                    )
+                    self._persist_and_notify_edge(best_key, is_new_edge=False)
+                    return
+                # Promote: remove old edge, add new at higher resolution with merged count
+                merged_count = best_edge["observation_count"] + 1
+                first_seen = best_edge.get("first_seen") or now
+                self._remove_edge_from_memory(best_key)
+                self._delete_edge_from_db(best_key)
+                with self.pending_lock:
+                    self.pending_updates.discard(best_key)
+
+                self.edges[edge_key] = {
+                    "from_prefix": from_prefix,
+                    "to_prefix": to_prefix,
+                    "from_public_key": from_public_key or best_edge.get("from_public_key"),
+                    "to_public_key": to_public_key or best_edge.get("to_public_key"),
+                    "observation_count": merged_count,
+                    "first_seen": first_seen,
+                    "last_seen": now,
+                    "avg_hop_position": hop_position if hop_position is not None else best_edge.get("avg_hop_position"),
+                    "geographic_distance": geographic_distance if geographic_distance is not None else best_edge.get("geographic_distance"),
+                    "confirmed_2byte": True if prefix_bytes == 2 else best_edge.get("confirmed_2byte", False),
+                }
+                self._outgoing_index[from_prefix].add(to_prefix)
+                self._incoming_index[to_prefix].add(from_prefix)
+
+                self._persist_and_notify_edge(edge_key, is_new_edge=True)
+                return
+
+        # Exact-key create or update (1-byte with 0 or 2+ matches, or 2/3-byte with no match)
         if edge_key in self.edges:
             edge = self.edges[edge_key]
             edge['observation_count'] += 1
@@ -206,6 +435,10 @@ class MeshGraph:
             if geographic_distance is not None:
                 edge['geographic_distance'] = geographic_distance
 
+            # 2-byte trace confirmation (for path weighting when supported)
+            if prefix_bytes == 2:
+                edge['confirmed_2byte'] = True
+
             is_new_edge = False
         else:
             # New edge — also update adjacency indexes
@@ -218,13 +451,17 @@ class MeshGraph:
                 'first_seen': now,
                 'last_seen': now,
                 'avg_hop_position': hop_position if hop_position is not None else None,
-                'geographic_distance': geographic_distance
+                'geographic_distance': geographic_distance,
+                'confirmed_2byte': True if prefix_bytes == 2 else False,
             }
             self._outgoing_index[from_prefix].add(to_prefix)
             self._incoming_index[to_prefix].add(from_prefix)
             is_new_edge = True
-        
-        # Persist according to write strategy
+
+        self._persist_and_notify_edge(edge_key, is_new_edge)
+
+    def _persist_and_notify_edge(self, edge_key: Tuple[str, str], is_new_edge: bool) -> None:
+        """Persist edge to DB (according to write strategy) and notify web viewer."""
         self.logger.debug(f"Mesh graph: Edge {edge_key} - new={is_new_edge}, strategy={self.write_strategy}")
         if self.write_strategy == 'immediate':
             self._write_edge_to_db(edge_key, is_new_edge)
@@ -232,21 +469,15 @@ class MeshGraph:
             with self.pending_lock:
                 self.pending_updates.add(edge_key)
                 if len(self.pending_updates) >= self.batch_max_pending:
-                    # Force flush if too many pending
                     self._flush_pending_updates_sync()
         elif self.write_strategy == 'hybrid':
             if is_new_edge:
-                # Immediate write for new edges
                 self._write_edge_to_db(edge_key, True)
             else:
-                # Batched for updates
                 with self.pending_lock:
                     self.pending_updates.add(edge_key)
                     if len(self.pending_updates) >= self.batch_max_pending:
-                        # Force flush if too many pending
                         self._flush_pending_updates_sync()
-        
-        # Notify web viewer of edge update
         self._notify_web_viewer_edge(edge_key, is_new_edge)
     
     def _notify_web_viewer_edge(self, edge_key: Tuple[str, str], is_new: bool):
@@ -710,6 +941,28 @@ class MeshGraph:
             self.logger.debug(f"Pruned {len(expired_keys)} expired graph edges (older than {self.edge_expiration_days} days)")
         return len(expired_keys)
 
+    def delete_expired_edges_from_db(self, days: int) -> int:
+        """Delete mesh_connections rows older than the given days.
+        Keeps the on-disk table aligned with in-memory pruning and prevents unbounded growth.
+        Called from the scheduler (e.g. daily). Use Data_Retention mesh_connections_retention_days
+        or Path_Command graph_edge_expiration_days.
+        Returns:
+            int: Number of rows deleted.
+        """
+        if days <= 0:
+            return 0
+        try:
+            deleted = self.db_manager.execute_update(
+                "DELETE FROM mesh_connections WHERE last_seen < datetime('now', ?)",
+                (f'-{days} days',)
+            )
+            if deleted > 0:
+                self.logger.info(f"Cleaned up {deleted} old mesh_connections entries (older than {days} days)")
+            return deleted
+        except Exception as e:
+            self.logger.error(f"Error cleaning up mesh_connections: {e}")
+            return 0
+
     def _start_batch_writer(self):
         """Start background task for batched writes."""
         def batch_writer_loop():
@@ -739,46 +992,34 @@ class MeshGraph:
             updates = list(self.pending_updates)
             self.pending_updates.clear()
 
-        conn = None
         location_cache: Dict[str, Tuple[float, float]] = {}
         try:
-            conn = self.db_manager.get_connection()
-            cursor = conn.cursor()
-            for edge_key in updates:
-                if edge_key not in self.edges:
-                    continue
-                edge = self.edges[edge_key]
-                # Recalculate distance if we have public keys
-                if edge.get('from_public_key') or edge.get('to_public_key'):
-                    recalculated = self._recalculate_distance_if_needed(
-                        edge, conn=conn, location_cache=location_cache
+            with self.db_manager.connection() as conn:
+                cursor = conn.cursor()
+                for edge_key in updates:
+                    if edge_key not in self.edges:
+                        continue
+                    edge = self.edges[edge_key]
+                    # Recalculate distance if we have public keys
+                    if edge.get('from_public_key') or edge.get('to_public_key'):
+                        recalculated = self._recalculate_distance_if_needed(
+                            edge, conn=conn, location_cache=location_cache
+                        )
+                        if recalculated is not None:
+                            edge['geographic_distance'] = recalculated
+                    # Check if edge exists in DB
+                    cursor.execute(
+                        'SELECT 1 FROM mesh_connections WHERE from_prefix = ? AND to_prefix = ?',
+                        (edge_key[0], edge_key[1]),
                     )
-                    if recalculated is not None:
-                        edge['geographic_distance'] = recalculated
-                # Check if edge exists in DB
-                cursor.execute(
-                    'SELECT 1 FROM mesh_connections WHERE from_prefix = ? AND to_prefix = ?',
-                    (edge_key[0], edge_key[1]),
-                )
-                is_new = cursor.fetchone() is None
-                # Distance was already recalculated above — tell _write_edge_to_db to skip it
-                self._write_edge_to_db(edge_key, is_new, conn=conn, location_cache=location_cache,
-                                       skip_distance_recalc=True)
-            if conn:
+                    is_new = cursor.fetchone() is None
+                    # Distance was already recalculated above — tell _write_edge_to_db to skip it
+                    self._write_edge_to_db(edge_key, is_new, conn=conn, location_cache=location_cache,
+                                           skip_distance_recalc=True)
                 conn.commit()
         except Exception as e:
             self.logger.warning(f"Error flushing graph updates: {e}")
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            # Connection already closed by context manager; rollback happened on exit if needed
         
         if updates:
             self.logger.debug(f"Flushed {len(updates)} pending graph edge updates")
@@ -788,74 +1029,70 @@ class MeshGraph:
         self._flush_pending_updates_sync()
     
     def has_edge(self, from_prefix: str, to_prefix: str) -> bool:
-        """Check if an edge exists in the graph.
-        
+        """Check if an edge exists in the graph (exact or prefix match).
+
         Args:
             from_prefix: Source node prefix.
             to_prefix: Destination node prefix.
-            
+
         Returns:
             bool: True if edge exists.
         """
-        from_prefix = from_prefix.lower()[:2]
-        to_prefix = to_prefix.lower()[:2]
-        return (from_prefix, to_prefix) in self.edges
-    
+        return self.get_edge(from_prefix, to_prefix) is not None
+
     def get_edge(self, from_prefix: str, to_prefix: str) -> Optional[Dict]:
-        """Get edge data if it exists.
-        
+        """Get edge data if it exists (exact key first, then prefix match).
+
         Args:
             from_prefix: Source node prefix.
             to_prefix: Destination node prefix.
-            
+
         Returns:
             Dict with edge data or None if not found.
         """
-        from_prefix = from_prefix.lower()[:2]
-        to_prefix = to_prefix.lower()[:2]
-        return self.edges.get((from_prefix, to_prefix))
+        from_norm = from_prefix.lower().strip() if from_prefix else ""
+        to_norm = to_prefix.lower().strip() if to_prefix else ""
+        if not from_norm or not to_norm:
+            return None
+        # Exact key first
+        exact = self.edges.get((from_norm, to_norm))
+        if exact is not None:
+            return exact
+        return self._get_edge_by_prefix_match(from_norm, to_norm)
     
     def get_outgoing_edges(self, prefix: str) -> List[Dict]:
-        """Get all edges originating from a node.
-
-        Uses the adjacency index for O(1) lookup instead of a full scan.
+        """Get all edges originating from a node (prefix match: returns edges where from_prefix matches prefix).
 
         Args:
-            prefix: Node prefix.
+            prefix: Node prefix (2, 4, or 6 hex chars).
 
         Returns:
             List of edge dictionaries.
         """
-        prefix = prefix.lower()[:2]
-        to_prefixes = self._outgoing_index.get(prefix)
-        if not to_prefixes:
+        prefix = prefix.lower().strip() if prefix else ""
+        if not prefix:
             return []
         result = []
-        for to_prefix in to_prefixes:
-            edge = self.edges.get((prefix, to_prefix))
-            if edge is not None:
+        for edge in self.edges.values():
+            if self._prefix_match(edge['from_prefix'], prefix):
                 result.append(edge)
         return result
 
     def get_incoming_edges(self, prefix: str) -> List[Dict]:
-        """Get all edges ending at a node.
-
-        Uses the adjacency index for O(1) lookup instead of a full scan.
+        """Get all edges ending at a node (prefix match: returns edges where to_prefix matches prefix).
 
         Args:
-            prefix: Node prefix.
+            prefix: Node prefix (2, 4, or 6 hex chars).
 
         Returns:
             List of edge dictionaries.
         """
-        prefix = prefix.lower()[:2]
-        from_prefixes = self._incoming_index.get(prefix)
-        if not from_prefixes:
+        prefix = prefix.lower().strip() if prefix else ""
+        if not prefix:
             return []
         result = []
-        for from_prefix in from_prefixes:
-            edge = self.edges.get((from_prefix, prefix))
-            if edge is not None:
+        for edge in self.edges.values():
+            if self._prefix_match(edge['to_prefix'], prefix):
                 result.append(edge)
         return result
     
@@ -1052,9 +1289,11 @@ class MeshGraph:
             List of (candidate_prefix, score) tuples sorted by score (highest first).
             Score is 0.0-1.0 based on path strength.
         """
-        from_prefix = from_prefix.lower()[:2]
-        to_prefix = to_prefix.lower()[:2]
-        
+        from_prefix = from_prefix.lower().strip() if from_prefix else ""
+        to_prefix = to_prefix.lower().strip() if to_prefix else ""
+        if not from_prefix or not to_prefix:
+            return []
+
         candidates: Dict[str, float] = {}
         
         # Try 2-hop paths first: from_prefix -> intermediate -> to_prefix
@@ -1154,18 +1393,12 @@ class MeshGraph:
     
     def shutdown(self):
         """Shutdown graph, flushing all pending writes."""
-        self.logger.info("Shutting down mesh graph, flushing pending writes...")
-        
+        # Do not log here: atexit may run after the logger's stream is closed.
         # Signal shutdown
         self._shutdown_event.set()
-        
+
         # Flush pending updates
         try:
             self._flush_pending_updates_sync()
-        except Exception as e:
-            self.logger.warning(f"Error flushing graph updates on shutdown: {e}")
-        
-        # Log final statistics
-        if self.edges:
-            total_observations = sum(e['observation_count'] for e in self.edges.values())
-            self.logger.info(f"Graph shutdown complete: {len(self.edges)} edges, {total_observations} total observations")
+        except Exception:
+            pass  # Avoid logging; stream may be closed during atexit

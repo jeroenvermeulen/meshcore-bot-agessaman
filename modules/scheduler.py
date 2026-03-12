@@ -8,13 +8,12 @@ import time
 import threading
 import schedule
 import datetime
-import pytz
 import sqlite3
 import json
 import os
 from typing import Dict, Tuple, Any
 from pathlib import Path
-from .utils import decode_escape_sequences, format_keyword_response_with_placeholders
+from .utils import decode_escape_sequences, format_keyword_response_with_placeholders, get_config_timezone
 
 
 class MessageScheduler:
@@ -27,20 +26,13 @@ class MessageScheduler:
         self.scheduler_thread = None
         self.last_channel_ops_check_time = 0
         self.last_message_queue_check_time = 0
+        self.last_data_retention_run = 0
+        self._data_retention_interval_seconds = 86400  # 24 hours
     
     def get_current_time(self):
         """Get current time in configured timezone"""
-        timezone_str = self.bot.config.get('Bot', 'timezone', fallback='')
-        
-        if timezone_str:
-            try:
-                tz = pytz.timezone(timezone_str)
-                return datetime.datetime.now(tz)
-            except pytz.exceptions.UnknownTimeZoneError:
-                self.logger.warning(f"Invalid timezone '{timezone_str}', using system timezone")
-                return datetime.datetime.now()
-        else:
-            return datetime.datetime.now()
+        tz, _ = get_config_timezone(self.bot.config, self.logger)
+        return datetime.datetime.now(tz)
     
     def setup_scheduled_messages(self):
         """Setup scheduled messages from config"""
@@ -186,7 +178,7 @@ class MessageScheduler:
             # Get recent activity from message_stats if available
             if info['recent_activity_24h'] == 0:
                 try:
-                    with sqlite3.connect(self.bot.db_manager.db_path, timeout=30.0) as conn:
+                    with self.bot.db_manager.connection() as conn:
                         cursor = conn.cursor()
                         # Check if message_stats table exists
                         cursor.execute('''
@@ -210,7 +202,7 @@ class MessageScheduler:
             # Query devices first heard in the last 7 days, grouped by role
             # Also calculate devices active in last 30 days (last_heard)
             try:
-                with sqlite3.connect(self.bot.db_manager.db_path, timeout=30.0) as conn:
+                with self.bot.db_manager.connection() as conn:
                     cursor = conn.cursor()
                     # Check if complete_contact_tracking table exists
                     cursor.execute('''
@@ -318,6 +310,13 @@ class MessageScheduler:
         self.scheduler_thread = threading.Thread(target=self.run_scheduler, daemon=True)
         self.scheduler_thread.start()
     
+    def join(self, timeout: float = 5.0) -> None:
+        """Wait for the scheduler thread to finish (e.g. during shutdown)."""
+        if self.scheduler_thread and self.scheduler_thread.is_alive():
+            self.scheduler_thread.join(timeout=timeout)
+            if self.scheduler_thread.is_alive():
+                self.logger.debug("Scheduler thread did not finish within %s s", timeout)
+    
     def run_scheduler(self):
         """Run the scheduler in a separate thread"""
         self.logger.info("Scheduler thread started")
@@ -397,7 +396,7 @@ class MessageScheduler:
                         try:
                             future.result(timeout=30)  # 30 second timeout
                         except Exception as e:
-                            self.logger.error(f"Error processing channel operations: {e}")
+                            self.logger.exception(f"Error processing channel operations: {e}")
                     else:
                         # Fallback: create new event loop if main loop not available
                         try:
@@ -423,7 +422,7 @@ class MessageScheduler:
                         try:
                             future.result(timeout=30)  # 30 second timeout
                         except Exception as e:
-                            self.logger.error(f"Error processing message queue: {e}")
+                            self.logger.exception(f"Error processing message queue: {e}")
                     else:
                         # Fallback: create new event loop if main loop not available
                         try:
@@ -435,11 +434,83 @@ class MessageScheduler:
                         loop.run_until_complete(self.bot.feed_manager.process_message_queue())
                     self.last_message_queue_check_time = time.time()
             
+            # Data retention: run daily (packet_stream, repeater tables, stats, caches, mesh_connections)
+            if time.time() - self.last_data_retention_run >= self._data_retention_interval_seconds:
+                self._run_data_retention()
+                self.last_data_retention_run = time.time()
+            
             schedule.run_pending()
             time.sleep(1)
         
         self.logger.info("Scheduler thread stopped")
     
+    def _run_data_retention(self):
+        """Run data retention cleanup: packet_stream, repeater tables, stats, caches, mesh_connections."""
+        import asyncio
+
+        def get_retention_days(section: str, key: str, default: int) -> int:
+            try:
+                if self.bot.config.has_section(section) and self.bot.config.has_option(section, key):
+                    return self.bot.config.getint(section, key)
+            except Exception:
+                pass
+            return default
+
+        packet_stream_days = get_retention_days('Data_Retention', 'packet_stream_retention_days', 3)
+        purging_log_days = get_retention_days('Data_Retention', 'purging_log_retention_days', 90)
+        daily_stats_days = get_retention_days('Data_Retention', 'daily_stats_retention_days', 90)
+        observed_paths_days = get_retention_days('Data_Retention', 'observed_paths_retention_days', 90)
+        mesh_connections_days = get_retention_days('Data_Retention', 'mesh_connections_retention_days', 7)
+        stats_days = get_retention_days('Stats_Command', 'data_retention_days', 7)
+
+        try:
+            # Packet stream (web viewer integration)
+            if hasattr(self.bot, 'web_viewer_integration') and self.bot.web_viewer_integration:
+                bi = getattr(self.bot.web_viewer_integration, 'bot_integration', None)
+                if bi and hasattr(bi, 'cleanup_old_data'):
+                    bi.cleanup_old_data(packet_stream_days)
+
+            # Repeater manager: purging_log and optional daily_stats / unique_advert / observed_paths
+            if hasattr(self.bot, 'repeater_manager') and self.bot.repeater_manager:
+                if hasattr(self.bot, 'main_event_loop') and self.bot.main_event_loop and self.bot.main_event_loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(
+                        self.bot.repeater_manager.cleanup_database(purging_log_days),
+                        self.bot.main_event_loop
+                    )
+                    try:
+                        future.result(timeout=60)
+                    except Exception as e:
+                        self.logger.error(f"Error in repeater_manager.cleanup_database: {e}")
+                else:
+                    try:
+                        loop = asyncio.get_event_loop()
+                    except RuntimeError:
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                    loop.run_until_complete(self.bot.repeater_manager.cleanup_database(purging_log_days))
+                if hasattr(self.bot.repeater_manager, 'cleanup_repeater_retention'):
+                    self.bot.repeater_manager.cleanup_repeater_retention(
+                        daily_stats_days=daily_stats_days,
+                        observed_paths_days=observed_paths_days
+                    )
+
+            # Stats tables (message_stats, command_stats, path_stats)
+            if hasattr(self.bot, 'command_manager') and self.bot.command_manager:
+                stats_cmd = self.bot.command_manager.commands.get('stats') if getattr(self.bot.command_manager, 'commands', None) else None
+                if stats_cmd and hasattr(stats_cmd, 'cleanup_old_stats'):
+                    stats_cmd.cleanup_old_stats(stats_days)
+
+            # Expired caches (geocoding_cache, generic_cache)
+            if hasattr(self.bot, 'db_manager') and self.bot.db_manager and hasattr(self.bot.db_manager, 'cleanup_expired_cache'):
+                self.bot.db_manager.cleanup_expired_cache()
+
+            # Mesh connections (DB prune to match in-memory expiration)
+            if hasattr(self.bot, 'mesh_graph') and self.bot.mesh_graph and hasattr(self.bot.mesh_graph, 'delete_expired_edges_from_db'):
+                self.bot.mesh_graph.delete_expired_edges_from_db(mesh_connections_days)
+
+        except Exception as e:
+            self.logger.exception(f"Error during data retention cleanup: {e}")
+
     def check_interval_advertising(self):
         """Check if it's time to send an interval-based advert"""
         try:
@@ -509,10 +580,8 @@ class MessageScheduler:
     async def _process_channel_operations(self):
         """Process pending channel operations from the web viewer"""
         try:
-            db_path = str(self.bot.db_manager.db_path)  # Ensure string, not Path object
-            
             # Get pending operations
-            with sqlite3.connect(db_path, timeout=30.0) as conn:
+            with self.bot.db_manager.connection() as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 
@@ -571,7 +640,7 @@ class MessageScheduler:
                             error_msg = "Failed to remove channel"
                     
                     # Update operation status
-                    with sqlite3.connect(db_path, timeout=30.0) as conn:
+                    with self.bot.db_manager.connection() as conn:
                         cursor = conn.cursor()
                         if success:
                             cursor.execute('''
@@ -595,7 +664,7 @@ class MessageScheduler:
                     self.logger.error(f"Error processing channel operation {op_id}: {e}")
                     # Mark as failed
                     try:
-                        with sqlite3.connect(db_path, timeout=30.0) as conn:
+                        with self.bot.db_manager.connection() as conn:
                             cursor = conn.cursor()
                             cursor.execute('''
                                 UPDATE channel_operations
@@ -611,7 +680,7 @@ class MessageScheduler:
         except Exception as e:
             db_path = getattr(self.bot.db_manager, 'db_path', 'unknown')
             db_path_str = str(db_path) if db_path != 'unknown' else 'unknown'
-            self.logger.error(f"Error in _process_channel_operations: {e}")
+            self.logger.exception(f"Error in _process_channel_operations: {e}")
             if db_path_str != 'unknown':
                 path_obj = Path(db_path_str)
                 self.logger.error(f"Database path: {db_path_str} (exists: {path_obj.exists()}, readable: {os.access(db_path_str, os.R_OK) if path_obj.exists() else False}, writable: {os.access(db_path_str, os.W_OK) if path_obj.exists() else False})")

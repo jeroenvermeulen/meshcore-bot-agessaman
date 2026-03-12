@@ -162,7 +162,8 @@
             },
             "paths": {
                 "none": "Sin datos de rutas",
-                "format": "{rank} {sender} {path}"
+                "format": "{rank} {sender} {path}",
+                "synopsis": "{rank} {sender}: {hops} hops"
             }
         },
         "solarforecast": {

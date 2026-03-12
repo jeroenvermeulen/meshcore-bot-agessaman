@@ -31,7 +31,7 @@ The bot will not start without these sections. The validator reports them as **e
 |----------------|----------------------------------------------|
 | `[Connection]` | Serial, BLE, or TCP connection parameters   |
 | `[Bot]`        | Database path, bot name, rate limits, etc.   |
-| `[Channels]`   | Monitor channels, DM behavior                |
+| `[Channels]`   | Monitor channels, DM behavior, optional flood_scope (scoped flooding) |
 
 ### Section names
 

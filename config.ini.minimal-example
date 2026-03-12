@@ -143,6 +143,9 @@ auto_manage_contacts = false
 # Default: meshcore_bot.db
 db_path = meshcore_bot.db
 
+# Local plugins directory (optional). Default: local. See config.ini.example.
+#local_dir_path = local
+
 [Localization]
 # Language code for bot responses (en, es, es-MX, es-ES, fr, de, ja, etc.)
 # Default: en (English)
@@ -228,6 +231,7 @@ log_level = INFO
 
 # Log file path (leave empty for console only)
 # Bot will write logs to this file in addition to console
+# Logs rotate at 5 MB with up to 3 backup files (e.g. meshcore_bot.log.1, .2, .3)
 log_file = meshcore_bot.log
 
 # Enable colored console output

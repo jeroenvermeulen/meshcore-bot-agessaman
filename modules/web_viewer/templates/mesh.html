@@ -309,6 +309,19 @@
         border-radius: 3px;
         font-family: 'Courier New', monospace;
     }
+    .mesh-node-popup .prefix-byte {
+        display: inline-block;
+        background-color: rgba(0, 0, 0, 0.08);
+        border: 1px solid rgba(0, 0, 0, 0.15);
+        border-radius: 3px;
+        padding: 2px 5px;
+        margin-right: 4px;
+        font-family: 'Courier New', monospace;
+        font-size: 0.9em;
+    }
+    .mesh-node-popup .prefix-byte:last-child {
+        margin-right: 0;
+    }
     /* Legend for connection highlighting */
     .connection-legend {
         position: absolute;
@@ -378,35 +391,81 @@
     let isInitialMapLoad = true; // Track if this is the first time rendering the map with nodes
     let highlightedPath = null; // Currently highlighted path data
     let pathHighlightTimeout = null; // Debounce timer for path resolution
-    
+
+    const PREFIX_HEX_CHARS = {{ prefix_hex_chars|default(2) }};  
+    // Graph prefix length from edges API (2, 4, or 6 hex chars); used for node prefix display and node fetch.
+    let graphPrefixHexChars = PREFIX_HEX_CHARS;
+    // Format prefix for display: add byte count when multi-byte (2 or 3 bytes)
+    function formatPrefixWithBytes(prefix) {
+        if (!prefix || typeof prefix !== 'string') return '';
+        const hexLen = prefix.length;
+        const bytes = hexLen / 2;
+        if (bytes === 1) return prefix;
+        return `${prefix} (${bytes} bytes)`;
+    }
+
+    // Format prefix as up to 3 space-separated bytes (e.g. 86 0C AB); numBytes = how many bytes to show.
+    function formatPrefixAsByteChunks(hexStr, numBytes) {
+        if (!hexStr || typeof hexStr !== 'string' || numBytes < 1) return '';
+        const raw = hexStr.replace(/\s/g, '');
+        if (raw.length < 2) return raw ? raw.slice(0, 2).toUpperCase() : '';
+        const parts = [];
+        for (let i = 0; i < numBytes && i * 2 < raw.length; i++) {
+            const pair = raw.slice(i * 2, i * 2 + 2);
+            if (pair.length === 2) parts.push(pair.toUpperCase());
+        }
+        return parts.join(' ');
+    }
+
+    // Same as formatPrefixAsByteChunks but returns HTML with each byte in its own box (span.prefix-byte).
+    function formatPrefixAsByteChunksHTML(hexStr, numBytes) {
+        const raw = formatPrefixAsByteChunks(hexStr, numBytes);
+        if (!raw) return '';
+        return raw.split(' ').map(byte => '<span class="prefix-byte">' + escapeHtml(byte) + '</span>').join(' ');
+    }
+  
     // Helper function to create unique node identifier
     function getNodeId(node) {
         return `${node.prefix}-${node.latitude.toFixed(6)}-${node.longitude.toFixed(6)}`;
     }
-    
-    // Detect if input is a hex path (2+ hex values)
-    function detectPathInput(input) {
-        if (!input || input.trim().length === 0) return false;
-        
-        // Normalize input: remove commas, spaces, colons
-        const normalized = input.replace(/[,\s:]/g, '');
-        
-        // Check if it's a continuous hex string (e.g., "8601a5")
-        // If it's all hex and has 4+ characters (2+ hex pairs), it's a path
-        if (/^[0-9a-fA-F]{4,}$/.test(normalized)) {
-            return true;
-        }
-        
-        // Also check for space-separated hex values
-        const hexPattern = /\b[0-9a-fA-F]{2}\b/g;
-        const matches = input.match(hexPattern);
-        
-        // If we have 2+ hex values, treat as path
-        return matches && matches.length >= 2;
+
+    // Resolve an edge prefix (2, 4, or 6 hex chars) to a node when node.prefix may be longer or equal.
+    function findNodeByEdgePrefix(prefix) {
+        if (!prefix) return null;
+        return filteredNodeMap[prefix] || filteredNodes.find(n => n.prefix.startsWith(prefix) || prefix.startsWith(n.prefix)) || null;
     }
-    
-    // Resolve path via API
-    async function resolvePath(pathInput) {
+
+    // Detect if input is a hex path (2+ hex values)
+  function detectPathInput(input) {
+      if (!input || input.trim().length === 0) return false;
+      
+      // Pull from template if you can, otherwise default.
+      // If you already have this elsewhere on the page, reuse it.
+      const prefixHexChars = PREFIX_HEX_CHARS;
+
+      // Normalize input: remove commas, spaces, colons
+      const normalized = input.replace(/[,\s:]/g, '');
+
+      // Check if it's a continuous hex string (e.g., "8601a5" or "8601A58F02")
+      // If it's all hex and has at least 2 tokens, treat as path.
+      // Optional: require it to align on token boundaries to reduce false positives.
+      const minChars = prefixHexChars * 2; // 2+ tokens
+      if (new RegExp(`^[0-9a-fA-F]{${minChars},}$`).test(normalized)) {
+          // If you want to be slightly stricter (still minimal), uncomment:
+          // if (normalized.length % prefixHexChars === 0) return true;
+          return true;
+      }
+
+      // Also check for space-separated hex values
+      const hexPattern = new RegExp(`\\b[0-9a-fA-F]{${prefixHexChars}}\\b`, 'g');
+      const matches = input.match(hexPattern);
+
+      // If we have 2+ hex values, treat as path
+      return matches && matches.length >= 2;
+  }
+      
+  // Resolve path via API
+  async function resolvePath(pathInput) {
         try {
             const response = await fetch('/api/mesh/resolve-path', {
                 method: 'POST',
@@ -816,8 +875,16 @@
         const skipRender = options && options.skipRender === true;
         
         try {
-            // Load nodes
-            const nodesResponse = await fetch('/api/mesh/nodes');
+            // Load edges first so we can pass prefix_hex_chars to nodes (keeps node prefix in sync with edge prefixes)
+            const edgesResponse = await fetch('/api/mesh/edges');
+            const edgesData = await edgesResponse.json();
+            allEdges = edgesData.edges || [];
+            graphPrefixHexChars = (edgesData.prefix_hex_chars && [2, 4, 6].includes(edgesData.prefix_hex_chars))
+                ? edgesData.prefix_hex_chars
+                : PREFIX_HEX_CHARS;
+            
+            // Load nodes with graph prefix length so node.prefix matches edge prefixes (e.g. 2-byte)
+            const nodesResponse = await fetch('/api/mesh/nodes?prefix_hex_chars=' + graphPrefixHexChars);
             const nodesData = await nodesResponse.json();
             allNodes = nodesData.nodes || [];
             
@@ -830,11 +897,6 @@
                     nodeMapByKey[node.public_key] = node; // Map by public key for accurate lookups
                 }
             });
-            
-            // Load edges
-            const edgesResponse = await fetch('/api/mesh/edges');
-            const edgesData = await edgesResponse.json();
-            allEdges = edgesData.edges || [];
             
             // Build edge map
             edgeMap = {};
@@ -934,16 +996,9 @@
             });
         }
         
-        // Get unique node prefixes from filtered edges
-        const nodePrefixes = new Set();
-        filteredEdges.forEach(edge => {
-            nodePrefixes.add(edge.from_prefix);
-            nodePrefixes.add(edge.to_prefix);
-        });
-        
-        // Filter nodes - must be in filtered edges AND pass other filters
+        // Filter nodes: include all repeaters with location that pass filters (not only those in edge set),
+        // so e0 nodes with no edges still appear on the map (with 0 connections).
         filteredNodes = candidateNodes.filter(node => {
-            if (!nodePrefixes.has(node.prefix)) return false;
             if (starredOnly && !node.is_starred) return false;
             // Only apply text search if it's not a path (path resolution is handled separately)
             if (searchTerm && !detectPathInput(searchTerm)) {
@@ -1199,8 +1254,8 @@
         // Add edges FIRST (so they appear below nodes)
         filteredEdges.forEach(edge => {
             // Resolve endpoints from filtered set only (so we don't draw edges to nodes outside node timeframe)
-            let fromNode = (edge.from_public_key && filteredNodeMapByKey[edge.from_public_key]) ? filteredNodeMapByKey[edge.from_public_key] : filteredNodeMap[edge.from_prefix];
-            let toNode = (edge.to_public_key && filteredNodeMapByKey[edge.to_public_key]) ? filteredNodeMapByKey[edge.to_public_key] : filteredNodeMap[edge.to_prefix];
+            let fromNode = (edge.from_public_key && filteredNodeMapByKey[edge.from_public_key]) ? filteredNodeMapByKey[edge.from_public_key] : (filteredNodeMap[edge.from_prefix] || findNodeByEdgePrefix(edge.from_prefix));
+            let toNode = (edge.to_public_key && filteredNodeMapByKey[edge.to_public_key]) ? filteredNodeMapByKey[edge.to_public_key] : (filteredNodeMap[edge.to_prefix] || findNodeByEdgePrefix(edge.to_prefix));
             if (!fromNode || !toNode) return;
             
             const color = getEdgeColor(edge);
@@ -1218,16 +1273,18 @@
             
             // Simple hover tooltip for quick info
             line.bindTooltip(`
-                ${edge.from_prefix} → ${edge.to_prefix}<br>
+                ${formatPrefixWithBytes(edge.from_prefix)} → ${formatPrefixWithBytes(edge.to_prefix)}<br>
                 Observations: ${edge.observation_count}<br>
                 Distance: ${edge.geographic_distance ? edge.geographic_distance.toFixed(1) + ' km' : 'N/A'}<br>
                 Last Seen: ${edge.last_seen ? new Date(edge.last_seen).toLocaleString() : 'Never'}
             `);
             
             // Create information-rich popup tooltip (similar to nodes) for click
+            const fromPrefixDisplay = formatPrefixWithBytes(edge.from_prefix);
+            const toPrefixDisplay = formatPrefixWithBytes(edge.to_prefix);
             const edgeTooltipContent = `
                 <div style="min-width: 250px;">
-                    <strong style="font-size: 1.1em;">${edge.from_prefix} → ${edge.to_prefix}</strong><br>
+                    <strong style="font-size: 1.1em;">${fromPrefixDisplay} → ${toPrefixDisplay}</strong><br>
                     <hr style="margin: 5px 0; border-color: #666;">
                     <table style="width: 100%; font-size: 0.9em;">
                         <tr>
@@ -1332,11 +1389,27 @@
             });
             
             // Create information-rich tooltip with all node details
-            const connections = filteredEdges.filter(e => 
-                e.from_prefix === node.prefix || e.to_prefix === node.prefix
+            // Match edges to this node by public_key or prefix (including prefix prefix-match: node "a58296" matches edge "a582")
+            const connections = filteredEdges.filter(e => {
+                const fromMatch = (e.from_public_key && e.from_public_key === node.public_key) || e.from_prefix === node.prefix || (node.prefix && e.from_prefix && (node.prefix.startsWith(e.from_prefix) || e.from_prefix.startsWith(node.prefix)));
+                const toMatch = (e.to_public_key && e.to_public_key === node.public_key) || e.to_prefix === node.prefix || (node.prefix && e.to_prefix && (node.prefix.startsWith(e.to_prefix) || e.to_prefix.startsWith(node.prefix)));
+                return fromMatch || toMatch;
+            });
+            const incoming = connections.filter(e => (e.to_public_key && e.to_public_key === node.public_key) || e.to_prefix === node.prefix || (node.prefix && e.to_prefix && (node.prefix.startsWith(e.to_prefix) || e.to_prefix.startsWith(node.prefix)))).length;
+            const outgoing = connections.filter(e => (e.from_public_key && e.from_public_key === node.public_key) || e.from_prefix === node.prefix || (node.prefix && e.from_prefix && (node.prefix.startsWith(e.from_prefix) || e.from_prefix.startsWith(node.prefix)))).length;
+            // Infer prefix byte width only from edges we know are this node (public_key match, or exact prefix match). Avoid prefix prefix-match so we don't count edges from other nodes that share a shorter prefix (e.g. another "a7" node).
+            const connectionsForByteWidth = filteredEdges.filter(e =>
+                (e.from_public_key && e.from_public_key === node.public_key) || (e.to_public_key && e.to_public_key === node.public_key) || e.from_prefix === node.prefix || e.to_prefix === node.prefix
             );
-            const incoming = connections.filter(e => e.to_prefix === node.prefix).length;
-            const outgoing = connections.filter(e => e.from_prefix === node.prefix).length;
+            let numBytes = 1;
+            for (const e of connectionsForByteWidth) {
+                const n = Math.max((e.from_prefix && e.from_prefix.length) || 0, (e.to_prefix && e.to_prefix.length) || 0) / 2;
+                if (n > numBytes) numBytes = n;
+            }
+            if (connectionsForByteWidth.length === 0) {
+                numBytes = 1;
+            }
+            numBytes = Math.min(3, Math.max(1, numBytes));
             
             const tooltipContent = `
                 <div style="min-width: 250px;">
@@ -1345,7 +1418,7 @@
                     <table style="width: 100%; font-size: 0.9em;">
                         <tr>
                             <td style="padding: 2px 8px 2px 0; color: #888;"><strong>Prefix:</strong></td>
-                            <td style="padding: 2px 0;"><code>${escapeHtml(node.prefix)}</code></td>
+                            <td style="padding: 2px 0;">${formatPrefixAsByteChunksHTML(node.public_key || node.prefix || '', numBytes)}</td>
                         </tr>
                         <tr>
                             <td style="padding: 2px 8px 2px 0; color: #888;"><strong>Public Key:</strong></td>
@@ -1502,8 +1575,8 @@
         const edgeMapById = new Map();
         filteredEdges.forEach(edge => {
             // Resolve endpoints from filtered set only (so we don't draw edges to nodes outside node timeframe)
-            let fromNode = (edge.from_public_key && filteredNodeMapByKey[edge.from_public_key]) ? filteredNodeMapByKey[edge.from_public_key] : filteredNodeMap[edge.from_prefix];
-            let toNode = (edge.to_public_key && filteredNodeMapByKey[edge.to_public_key]) ? filteredNodeMapByKey[edge.to_public_key] : filteredNodeMap[edge.to_prefix];
+            let fromNode = (edge.from_public_key && filteredNodeMapByKey[edge.from_public_key]) ? filteredNodeMapByKey[edge.from_public_key] : (filteredNodeMap[edge.from_prefix] || findNodeByEdgePrefix(edge.from_prefix));
+            let toNode = (edge.to_public_key && filteredNodeMapByKey[edge.to_public_key]) ? filteredNodeMapByKey[edge.to_public_key] : (filteredNodeMap[edge.to_prefix] || findNodeByEdgePrefix(edge.to_prefix));
             if (!fromNode || !toNode) return;
             
             // Use unique node IDs for from/to to handle prefix collisions
@@ -1635,8 +1708,8 @@
                 const edgeStyles = {};
                 const bidirectionalEdgeIds = new Set();
                 filteredEdges.forEach(edge => {
-                    let fromNode = (edge.from_public_key && filteredNodeMapByKey[edge.from_public_key]) ? filteredNodeMapByKey[edge.from_public_key] : filteredNodeMap[edge.from_prefix];
-                    let toNode = (edge.to_public_key && filteredNodeMapByKey[edge.to_public_key]) ? filteredNodeMapByKey[edge.to_public_key] : filteredNodeMap[edge.to_prefix];
+                    let fromNode = (edge.from_public_key && filteredNodeMapByKey[edge.from_public_key]) ? filteredNodeMapByKey[edge.from_public_key] : (filteredNodeMap[edge.from_prefix] || findNodeByEdgePrefix(edge.from_prefix));
+                    let toNode = (edge.to_public_key && filteredNodeMapByKey[edge.to_public_key]) ? filteredNodeMapByKey[edge.to_public_key] : (filteredNodeMap[edge.to_prefix] || findNodeByEdgePrefix(edge.to_prefix));
                     if (!fromNode || !toNode) return;
                     const fromNodeId = getNodeId(fromNode);
                     const toNodeId = getNodeId(toNode);
@@ -1645,8 +1718,8 @@
                         edgeIdsToHighlight.push(edgeId);
                         const reverseEdgeId = `${toNodeId}-${fromNodeId}`;
                         if (filteredEdges.some(e => {
-                            let revFromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : filteredNodeMap[e.from_prefix];
-                            let revToNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : filteredNodeMap[e.to_prefix];
+                            let revFromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : (filteredNodeMap[e.from_prefix] || findNodeByEdgePrefix(e.from_prefix));
+                            let revToNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : (filteredNodeMap[e.to_prefix] || findNodeByEdgePrefix(e.to_prefix));
                             if (!revFromNode || !revToNode) return false;
                             return getNodeId(revFromNode) === toNodeId && getNodeId(revToNode) === fromNodeId;
                         })) {
@@ -1699,8 +1772,8 @@
                     for (const edge of currentEdges) {
                         const edgeId = edge.id;
                         const originalEdge = filteredEdges.find(e => {
-                            let fromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : filteredNodeMap[e.from_prefix];
-                            let toNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : filteredNodeMap[e.to_prefix];
+                            let fromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : (filteredNodeMap[e.from_prefix] || findNodeByEdgePrefix(e.from_prefix));
+                            let toNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : (filteredNodeMap[e.to_prefix] || findNodeByEdgePrefix(e.to_prefix));
                             if (!fromNode || !toNode) return false;
                             return `${getNodeId(fromNode)}-${getNodeId(toNode)}` === edgeId;
                         });
@@ -1740,8 +1813,8 @@
                     const edgeId = params.edges[0]; // This is now fromNodeId-toNodeId format
                     // Find edge by matching the unique node IDs
                     const edge = filteredEdges.find(e => {
-                        let fromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : filteredNodeMap[e.from_prefix];
-                        let toNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : filteredNodeMap[e.to_prefix];
+                        let fromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : (filteredNodeMap[e.from_prefix] || findNodeByEdgePrefix(e.from_prefix));
+                        let toNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : (filteredNodeMap[e.to_prefix] || findNodeByEdgePrefix(e.to_prefix));
                         if (!fromNode || !toNode) return false;
                         const expectedEdgeId = `${getNodeId(fromNode)}-${getNodeId(toNode)}`;
                         return expectedEdgeId === edgeId;
@@ -2002,8 +2075,8 @@
         const connectedNodeIds = new Set([clickedNodeId]);
         
         filteredEdges.forEach(edge => {
-            let fromNode = (edge.from_public_key && filteredNodeMapByKey[edge.from_public_key]) ? filteredNodeMapByKey[edge.from_public_key] : filteredNodeMap[edge.from_prefix];
-            let toNode = (edge.to_public_key && filteredNodeMapByKey[edge.to_public_key]) ? filteredNodeMapByKey[edge.to_public_key] : filteredNodeMap[edge.to_prefix];
+            let fromNode = (edge.from_public_key && filteredNodeMapByKey[edge.from_public_key]) ? filteredNodeMapByKey[edge.from_public_key] : (filteredNodeMap[edge.from_prefix] || findNodeByEdgePrefix(edge.from_prefix));
+            let toNode = (edge.to_public_key && filteredNodeMapByKey[edge.to_public_key]) ? filteredNodeMapByKey[edge.to_public_key] : (filteredNodeMap[edge.to_prefix] || findNodeByEdgePrefix(edge.to_prefix));
             if (!fromNode || !toNode) return;
             
             const fromNodeId = getNodeId(fromNode);
@@ -2019,8 +2092,8 @@
                 // Check for bidirectional
                 const reverseEdgeId = `${toNodeId}-${fromNodeId}`;
                 if (filteredEdges.some(e => {
-                    let revFromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : filteredNodeMap[e.from_prefix];
-                    let revToNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : filteredNodeMap[e.to_prefix];
+                    let revFromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : (filteredNodeMap[e.from_prefix] || findNodeByEdgePrefix(e.from_prefix));
+                    let revToNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : (filteredNodeMap[e.to_prefix] || findNodeByEdgePrefix(e.to_prefix));
                     if (!revFromNode || !revToNode) return false;
                     return getNodeId(revFromNode) === toNodeId && getNodeId(revToNode) === fromNodeId;
                 })) {
@@ -2161,8 +2234,8 @@
             for (const edge of currentEdges) {
                 const edgeId = edge.id;
                 const originalEdge = filteredEdges.find(e => {
-                    let fromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : filteredNodeMap[e.from_prefix];
-                    let toNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : filteredNodeMap[e.to_prefix];
+                    let fromNode = (e.from_public_key && filteredNodeMapByKey[e.from_public_key]) ? filteredNodeMapByKey[e.from_public_key] : (filteredNodeMap[e.from_prefix] || findNodeByEdgePrefix(e.from_prefix));
+                    let toNode = (e.to_public_key && filteredNodeMapByKey[e.to_public_key]) ? filteredNodeMapByKey[e.to_public_key] : (filteredNodeMap[e.to_prefix] || findNodeByEdgePrefix(e.to_prefix));
                     if (!fromNode || !toNode) return false;
                     const expectedEdgeId = `${getNodeId(fromNode)}-${getNodeId(toNode)}`;
                     return expectedEdgeId === edgeId;

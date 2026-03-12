@@ -145,48 +145,30 @@ class TestCommand(BaseCommand):
         return None
     
     def _extract_path_node_ids(self, message: MeshMessage) -> List[str]:
-        """Extract path node IDs from message path string.
+        """Extract path node IDs from message. Prefers routing_info.path_nodes (multi-byte); else parses message.path.
         
-        Args:
-            message: The message object containing the path.
-            
         Returns:
-            List[str]: List of valid 2-character hex node IDs.
+            List[str]: List of node IDs (2, 4, or 6 hex chars per node, uppercase).
         """
-        if not message.path:
+        routing_info = getattr(message, 'routing_info', None)
+        if routing_info is not None and routing_info.get('path_length', 0) == 0:
             return []
-        
-        # Check if it's a direct connection
-        if "Direct" in message.path or "0 hops" in message.path:
+        if routing_info and routing_info.get('path_nodes'):
+            return [str(n).upper().strip() for n in routing_info['path_nodes']]
+        if not message.path or "Direct" in message.path or "0 hops" in message.path:
             return []
-        
-        # Extract path nodes from the path string
-        # Path strings are typically in format: "node1,node2,node3 via ROUTE_TYPE_*"
-        # or just "node1,node2,node3"
         path_string = message.path
-        
-        # Remove route type suffix if present
         if " via ROUTE_TYPE_" in path_string:
             path_string = path_string.split(" via ROUTE_TYPE_")[0]
-        
-        # Check if it looks like a comma-separated path
+        if '(' in path_string:
+            path_string = path_string.split('(')[0].strip()
         if ',' in path_string:
-            # Clean up any extra info (like hop counts in parentheses)
-            # Example: "01,7e,55,86 (4 hops)" -> "01,7e,55,86"
-            if '(' in path_string:
-                path_string = path_string.split('(')[0].strip()
-            
-            # Validate that all parts are 2-character hex values
-            parts = path_string.split(',')
-            valid_parts = []
-            for part in parts:
-                part = part.strip()
-                # Check if it's a 2-character hex value
-                if len(part) == 2 and all(c in '0123456789abcdefABCDEF' for c in part):
-                    valid_parts.append(part.upper())
-            
-            return valid_parts
-        
+            parts = [p.strip() for p in path_string.split(',') if p.strip()]
+            if parts and all(
+                len(p) in (2, 4, 6) and all(c in '0123456789aAbBcCdDeEfF' for c in p)
+                for p in parts
+            ):
+                return [p.upper() for p in parts]
         return []
     
     
@@ -576,8 +558,14 @@ class TestCommand(BaseCommand):
         """
         node_ids = self._extract_path_node_ids(message)
         if len(node_ids) < 2:
-            # Check if it's a direct connection
-            if not message.path or "Direct" in message.path or "0 hops" in message.path:
+            routing_info = getattr(message, 'routing_info', None)
+            is_direct = (
+                (routing_info is not None and routing_info.get('path_length', 0) == 0)
+                or not message.path
+                or "Direct" in (message.path or "")
+                or "0 hops" in (message.path or "")
+            )
+            if is_direct:
                 return "N/A"  # Direct connection, no path to calculate
             return ""  # Path exists but insufficient nodes
         
@@ -628,8 +616,14 @@ class TestCommand(BaseCommand):
         """
         node_ids = self._extract_path_node_ids(message)
         if len(node_ids) < 2:
-            # Check if it's a direct connection
-            if not message.path or "Direct" in message.path or "0 hops" in message.path:
+            routing_info = getattr(message, 'routing_info', None)
+            is_direct = (
+                (routing_info is not None and routing_info.get('path_length', 0) == 0)
+                or not message.path
+                or "Direct" in (message.path or "")
+                or "0 hops" in (message.path or "")
+            )
+            if is_direct:
                 return "N/A"  # Direct connection, no path to calculate
             return ""  # Path exists but insufficient nodes
         
@@ -686,20 +680,35 @@ class TestCommand(BaseCommand):
             connection_info = self.build_enhanced_connection_info(message)
             timestamp = self.format_timestamp(message)
             elapsed = self.format_elapsed(message)
-            
-            # Calculate distance placeholders
+            path_display = self.get_path_display_string(message)
+            # Hops: from message.hops, or routing_info.path_length, or len(path_nodes)
+            routing_info = getattr(message, 'routing_info', None)
+            if getattr(message, 'hops', None) is not None:
+                hops_val = message.hops
+            elif routing_info is not None:
+                hops_val = routing_info.get('path_length')
+                if hops_val is None and routing_info.get('path_nodes'):
+                    hops_val = len(routing_info['path_nodes'])
+            else:
+                hops_val = None
+            hops_str = str(hops_val) if hops_val is not None else "?"
+            if hops_val is None:
+                hops_label = "?"
+            elif hops_val == 1:
+                hops_label = "1 hop"
+            else:
+                hops_label = f"{hops_val} hops"
             path_distance = self._calculate_path_distance(message)
             firstlast_distance = self._calculate_firstlast_distance(message)
-            
-            # Format phrase part - add colon and space if phrase exists
             phrase_part = f": {phrase}" if phrase else ""
-            
             return response_format.format(
                 sender=message.sender_id or self.translate('common.unknown_sender'),
                 phrase=phrase,
                 phrase_part=phrase_part,
                 connection_info=connection_info,
-                path=message.path or self.translate('common.unknown_path'),
+                path=path_display,
+                hops=hops_str,
+                hops_label=hops_label,
                 timestamp=timestamp,
                 elapsed=elapsed,
                 snr=message.snr or self.translate('common.unknown'),

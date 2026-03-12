@@ -9,6 +9,7 @@ import sys
 import inspect
 import importlib
 import importlib.util
+import types
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Type
 import logging
@@ -19,11 +20,20 @@ from .commands.base_command import BaseCommand
 class PluginLoader:
     """Handles dynamic loading and discovery of command plugins"""
     
-    def __init__(self, bot, commands_dir: str = None):
+    def __init__(self, bot, commands_dir: str = None, local_commands_dir: Optional[str] = None):
         self.bot = bot
         self.logger = bot.logger
         self.commands_dir = commands_dir or os.path.join(os.path.dirname(__file__), 'commands')
         self.alternatives_dir = os.path.join(self.commands_dir, 'alternatives')
+        if local_commands_dir is not None:
+            self.local_commands_dir = local_commands_dir
+        else:
+            bot_root = getattr(bot, 'bot_root', None)
+            if bot_root is not None:
+                path = Path(bot_root) / "local" / "commands"
+                self.local_commands_dir = str(path) if path.exists() else None
+            else:
+                self.local_commands_dir = None
         self.loaded_plugins: Dict[str, BaseCommand] = {}
         self.plugin_metadata: Dict[str, Dict[str, Any]] = {}
         self.keyword_mappings: Dict[str, str] = {}  # keyword -> plugin_name
@@ -85,6 +95,21 @@ class PluginLoader:
         if plugin_files:
             self.logger.info(f"Discovered {len(plugin_files)} alternative plugin files: {plugin_files}")
         return plugin_files
+    
+    def discover_local_plugins(self) -> List[str]:
+        """Discover Python files in local/commands (stems only). Skip __init__.py."""
+        if not self.local_commands_dir:
+            return []
+        path = Path(self.local_commands_dir)
+        if not path.exists():
+            return []
+        stems = []
+        for file_path in path.glob("*.py"):
+            if file_path.name != "__init__.py":
+                stems.append(file_path.stem)
+        if stems:
+            self.logger.info(f"Discovered {len(stems)} local plugin file(s): {stems}")
+        return stems
     
     def _validate_plugin(self, plugin_class: Type[BaseCommand]) -> List[str]:
         """
@@ -221,6 +246,62 @@ class PluginLoader:
             self._failed_plugins[plugin_name] = error_msg
             return None
     
+    def load_plugin_from_path(self, file_path: Path) -> Optional[BaseCommand]:
+        """Load a single plugin from a file path (e.g. local/commands/my_command.py)."""
+        # Ensure parent package exists so relative/absolute imports of "local_plugins" work.
+        # Set __path__ so Python treats it as a package and can load submodules (e.g. local_plugins.utils).
+        if "local_plugins" not in sys.modules:
+            pkg = types.ModuleType("local_plugins")
+            pkg.__path__ = [str(file_path.parent)]
+            sys.modules["local_plugins"] = pkg
+        stem = file_path.stem
+        module_name = f"local_plugins.{stem}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            if spec is None or spec.loader is None:
+                self.logger.warning(f"Could not create spec for {file_path}")
+                return None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            command_class = None
+            for _name, obj in inspect.getmembers(module, inspect.isclass):
+                if (
+                    issubclass(obj, BaseCommand)
+                    and obj != BaseCommand
+                    and obj.__module__ == module_name
+                ):
+                    command_class = obj
+                    break
+            if not command_class:
+                error_msg = f"No valid command class found in {stem}"
+                self.logger.warning(error_msg)
+                self._failed_plugins[stem] = error_msg
+                return None
+            validation_errors = self._validate_plugin(command_class)
+            if validation_errors:
+                error_msg = f"Plugin validation failed: {', '.join(validation_errors)}"
+                self.logger.error(f"Failed to load local plugin '{stem}': {error_msg}")
+                self._failed_plugins[stem] = error_msg
+                return None
+            plugin_instance = command_class(self.bot)
+            if not hasattr(plugin_instance, 'name') or not plugin_instance.name:
+                derived_name = command_class.__name__.lower().replace('command', '')
+                plugin_instance.name = derived_name
+            instance_validation_errors = self._validate_plugin_instance(plugin_instance, stem)
+            if instance_validation_errors:
+                error_msg = f"Plugin instance validation failed: {', '.join(instance_validation_errors)}"
+                self.logger.error(f"Failed to load local plugin '{stem}': {error_msg}")
+                self._failed_plugins[stem] = error_msg
+                return None
+            self.logger.info(f"Successfully loaded local plugin: {plugin_instance.get_metadata()['name']} from {stem}")
+            return plugin_instance
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.error(f"Failed to load local plugin '{stem}': {error_msg}")
+            self._failed_plugins[stem] = error_msg
+            return None
+    
     def load_all_plugins(self) -> Dict[str, BaseCommand]:
         """Load all discovered plugins, with alternative plugins taking priority when configured"""
         # First, discover all default and alternative plugins
@@ -317,6 +398,25 @@ class PluginLoader:
                 
                 loaded_plugins[alt_plugin_name] = alt_instance
                 self.plugin_metadata[alt_plugin_name] = alt_metadata
+        
+        # Fourth pass: Load local plugins from local/commands (additive; duplicate names skipped)
+        if self.local_commands_dir:
+            local_path = Path(self.local_commands_dir)
+            for stem in self.discover_local_plugins():
+                file_path = local_path / f"{stem}.py"
+                if not file_path.is_file():
+                    continue
+                plugin_instance = self.load_plugin_from_path(file_path)
+                if plugin_instance:
+                    metadata = plugin_instance.get_metadata()
+                    plugin_name = metadata['name']
+                    if plugin_name in loaded_plugins:
+                        self.logger.warning(
+                            f"Local plugin '{stem}' has name '{plugin_name}' which is already loaded; skipping"
+                        )
+                        continue
+                    loaded_plugins[plugin_name] = plugin_instance
+                    self.plugin_metadata[plugin_name] = metadata
         
         # Build keyword mappings for all loaded plugins
         for plugin_name, plugin_instance in loaded_plugins.items():

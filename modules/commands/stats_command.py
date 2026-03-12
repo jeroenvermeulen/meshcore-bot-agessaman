@@ -48,6 +48,11 @@ class StatsCommand(BaseCommand):
         self.stats_enabled = self.get_config_value('Stats_Command', 'enabled', fallback=None, value_type='bool')
         if self.stats_enabled is None:
             self.stats_enabled = self.get_config_value('Stats_Command', 'stats_enabled', fallback=True, value_type='bool')
+        # Optional: collect_stats (defaults to stats_enabled). When true, messages/commands/paths
+        # are recorded for the web viewer dashboard even if enabled = false.
+        self.collect_stats = self.get_config_value('Stats_Command', 'collect_stats', fallback=None, value_type='bool')
+        if self.collect_stats is None:
+            self.collect_stats = self.stats_enabled
         self.data_retention_days = self.get_config_value('Stats_Command', 'data_retention_days', fallback=7, value_type='int')
         self.auto_cleanup = self.get_config_value('Stats_Command', 'auto_cleanup', fallback=True, value_type='bool')
         self.track_all_messages = self.get_config_value('Stats_Command', 'track_all_messages', fallback=True, value_type='bool')
@@ -61,7 +66,7 @@ class StatsCommand(BaseCommand):
         don't already exist. Also sets up necessary indexes for performance.
         """
         try:
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Create message_stats table for tracking all messages
@@ -129,11 +134,11 @@ class StatsCommand(BaseCommand):
     
     def record_message(self, message: MeshMessage) -> None:
         """Record a message in the stats database.
-        
+
         Args:
             message: The message to record statistics for.
         """
-        if not self.stats_enabled or not self.track_all_messages:
+        if not self.collect_stats or not self.track_all_messages:
             return
             
         try:
@@ -144,7 +149,7 @@ class StatsCommand(BaseCommand):
                 import hashlib
                 sender_id = f"user_{hashlib.md5(sender_id.encode()).hexdigest()[:8]}"
             
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO message_stats 
@@ -173,7 +178,7 @@ class StatsCommand(BaseCommand):
             command_name: The name of the command executed.
             response_sent: Whether a response was sent back to the user.
         """
-        if not self.stats_enabled or not self.track_command_details:
+        if not self.collect_stats or not self.track_command_details:
             return
             
         try:
@@ -184,7 +189,7 @@ class StatsCommand(BaseCommand):
                 import hashlib
                 sender_id = f"user_{hashlib.md5(sender_id.encode()).hexdigest()[:8]}"
             
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO command_stats 
@@ -204,13 +209,13 @@ class StatsCommand(BaseCommand):
     
     def record_path_stats(self, message: MeshMessage) -> None:
         """Record path statistics for longest path tracking.
-        
+
         Args:
             message: The message containing path information.
         """
-        if not self.stats_enabled or not self.track_all_messages:
+        if not self.collect_stats or not self.track_all_messages:
             return
-            
+
         # Only record if we have meaningful path data
         if not message.hops or message.hops <= 0 or not message.path:
             return
@@ -230,7 +235,7 @@ class StatsCommand(BaseCommand):
             # Format the path string properly (e.g., "75,24,1d,5f,bd")
             path_string = self._format_path_for_display(message.path)
             
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     INSERT INTO path_stats 
@@ -278,34 +283,45 @@ class StatsCommand(BaseCommand):
         return False
     
     def _format_path_for_display(self, path: str) -> str:
-        """Format path string for display (e.g., '75,24,1d,5f,bd').
-        
+        """Format path string for display (e.g., '75,24,1d,5f,bd' or '0102,5f7e' for 2-byte hops).
+
+        Uses bot.prefix_hex_chars for multi-byte path support; falls back to 2-char (1-byte)
+        chunks when length is not divisible or for legacy paths.
+
         Args:
-            path: The raw path string.
-            
+            path: The raw path string (hex, possibly with commas).
+
         Returns:
             str: The formatted path string.
         """
         if not path:
             return "Direct"
-        
+
         # If path already contains commas, it's likely already formatted
         if ',' in path:
             return path
-        
-        # If path contains descriptive text (like "Routed through X hops"), 
+
+        # If path contains descriptive text (like "Routed through X hops"),
         # extract just the numeric part or return as-is
         if ' ' in path and not all(c in '0123456789abcdefABCDEF' for c in path.replace(' ', '')):
             # This looks like descriptive text, return as-is
             return path
-        
-        # If path is a hex string without separators, add commas every 2 characters
-        # But only if it looks like a hex string (all hex characters)
+
+        # Use configured hex chars per node for multi-byte path support (2 = 1 byte, 4 = 2 bytes, 6 = 3 bytes)
+        hex_chars = getattr(self.bot, 'prefix_hex_chars', 2)
+        if hex_chars <= 0:
+            hex_chars = 2
+
+        # If path is a hex string without separators, chunk by hex_chars per hop
         if len(path) > 2 and ',' not in path and all(c in '0123456789abcdefABCDEF' for c in path):
-            # Split into 2-character chunks and join with commas
-            formatted = ','.join([path[i:i+2] for i in range(0, len(path), 2)])
-            return formatted
-        
+            if (len(path) % hex_chars) == 0:
+                formatted = ','.join([path[i:i + hex_chars] for i in range(0, len(path), hex_chars)])
+                if formatted:
+                    return formatted
+            # Legacy fallback: length not divisible by hex_chars, use 2-char (1-byte) chunks
+            formatted = ','.join([path[i:i + 2] for i in range(0, len(path), 2)])
+            return formatted if formatted else path
+
         # If it's already a single node ID or short path, return as-is
         return path
     
@@ -382,7 +398,7 @@ class StatsCommand(BaseCommand):
             now = int(time.time())
             day_ago = now - (24 * 60 * 60)
             
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Bot commands received
@@ -451,7 +467,7 @@ class StatsCommand(BaseCommand):
             now = int(time.time())
             day_ago = now - (24 * 60 * 60)
             
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Top bot users (people who triggered commands)
@@ -492,7 +508,7 @@ class StatsCommand(BaseCommand):
             now = int(time.time())
             day_ago = now - (24 * 60 * 60)
             
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Top channels by message count with unique user counts
@@ -538,7 +554,7 @@ class StatsCommand(BaseCommand):
             now = int(time.time())
             day_ago = now - (24 * 60 * 60)
             
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Top longest paths (one per user, more results with compact format)
@@ -566,13 +582,18 @@ class StatsCommand(BaseCommand):
                     for i, (sender, path_len, path_str) in enumerate(longest_paths, 1):
                         # Truncate sender name to fit more data
                         display_sender = sender[:8] + "..." if len(sender) > 11 else sender
-                        # Compact format: "1 Gundam 56,1c,98,1a,aa,cd,5f"
-                        new_line = self.translate('commands.stats.paths.format', rank=i, sender=display_sender, path=path_str) + "\n"
-                        
+                        # Full line: rank + sender + ": " + path (same as format template)
+                        full_line = self.translate('commands.stats.paths.format', rank=i, sender=display_sender, path=path_str) + "\n"
+                        # When a single path line would exceed the message limit, use synopsis (rank + sender + hop count only)
+                        if len(full_line) > max_length:
+                            new_line = self.translate('commands.stats.paths.synopsis', rank=i, sender=display_sender, hops=path_len) + "\n"
+                        else:
+                            new_line = full_line
+
                         # Check if adding this line would exceed the limit
                         if len(response + new_line) > max_length:
                             break
-                        
+
                         response += new_line
                 else:
                     response = self.translate('commands.stats.paths.none') + "\n"
@@ -594,7 +615,7 @@ class StatsCommand(BaseCommand):
             str: Formatted leaderboard string.
         """
         try:
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Check if daily_stats table exists
@@ -762,7 +783,7 @@ class StatsCommand(BaseCommand):
         try:
             cutoff_time = int(time.time()) - (days_to_keep * 24 * 60 * 60)
             
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Clean up old message stats
@@ -793,7 +814,7 @@ class StatsCommand(BaseCommand):
             Dict[str, Any]: Dictionary containing summary statistics.
         """
         try:
-            with sqlite3.connect(self.bot.db_manager.db_path) as conn:
+            with self.bot.db_manager.connection() as conn:
                 cursor = conn.cursor()
                 
                 # Total messages

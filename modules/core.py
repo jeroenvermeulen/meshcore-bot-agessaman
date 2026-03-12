@@ -8,6 +8,7 @@ import asyncio
 import configparser
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import colorlog
 import time
 import threading
@@ -16,15 +17,12 @@ import signal
 import atexit
 import sqlite3
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Callable
 from dataclasses import dataclass
 
 # Import the official meshcore package
 import meshcore
 from meshcore import EventType
-
-# Import command functions from meshcore-cli
-from meshcore_cli.meshcore_cli import send_cmd, send_chan_msg
 
 # Import our modules
 from .rate_limiter import RateLimiter, BotTxRateLimiter, PerUserRateLimiter, NominatimRateLimiter
@@ -43,22 +41,6 @@ from .transmission_tracker import TransmissionTracker
 from .utils import resolve_path
 
 
-class _DuplicateAwareConfigParser(configparser.ConfigParser):
-    """ConfigParser that allows duplicate options (last value wins) and logs ERROR when seen."""
-
-    def __init__(self, *args, **kwargs):
-        kwargs['strict'] = False
-        super().__init__(*args, **kwargs)
-
-    def _handle_option(self, st, line, fpname):
-        if st.optname in st.options:
-            logging.getLogger(__name__).error(
-                "Duplicate option in config file: section [%s], option '%s' (file %s, line %s). Using last value.",
-                st.sectname, st.optname, fpname, getattr(st, 'lineno', '?'),
-            )
-        st.options[st.optname] = st.optvalue
-
-
 class MeshCoreBot:
     """MeshCore Bot using official meshcore package.
     
@@ -68,7 +50,7 @@ class MeshCoreBot:
     
     def __init__(self, config_file: str = "config.ini"):
         self.config_file = config_file
-        self.config = _DuplicateAwareConfigParser()
+        self.config = configparser.ConfigParser()
         self.load_config()
         
         # Setup logging
@@ -95,6 +77,11 @@ class MeshCoreBot:
         except (OSError, ValueError, sqlite3.Error) as e:
             self.logger.error(f"Failed to initialize database manager: {e}")
             raise
+
+        # Set length of prefix
+        self.prefix_bytes = self.config.getint("Bot", "prefix_bytes", fallback=1)
+        self.prefix_hex_chars = self.prefix_bytes * 2
+        self.logger.info(f"Prefix mode: {self.prefix_bytes} bytes ({self.prefix_hex_chars} hex chars)")
         
         # Store start time in database for web viewer access
         try:
@@ -186,7 +173,10 @@ class MeshCoreBot:
         # Load max_channels from config (default 40, MeshCore supports up to 40 channels)
         max_channels = self.config.getint('Bot', 'max_channels', fallback=40)
         self.channel_manager = ChannelManager(self, max_channels=max_channels)
-        
+
+        # Callbacks invoked when the bot sends a channel message (e.g. Discord/Telegram bridges)
+        self.channel_sent_listeners: List[Callable] = []
+
         self.scheduler = MessageScheduler(self)
         
         # Initialize feed manager
@@ -224,7 +214,9 @@ class MeshCoreBot:
         # Initialize service plugin loader and load all services
         self.logger.info("Initializing service plugin loader")
         try:
-            self.service_loader = ServicePluginLoader(self)
+            self.service_loader = ServicePluginLoader(
+                self, local_services_dir=str(self._local_root / "service_plugins")
+            )
             self.services = self.service_loader.load_all_services()
             self.logger.info(f"Service plugin loader initialized with {len(self.services)} service(s)")
         except (OSError, ImportError, AttributeError, ValueError) as e:
@@ -278,7 +270,18 @@ class MeshCoreBot:
         
         # Force UTF-8 so emoji and non-ASCII characters in config.ini parse on Windows.
         self.config.read(self.config_file, encoding="utf-8")
-    
+        # Resolve local plugins directory from [Bot] local_dir_path (default: local)
+        self._local_root = Path(
+            resolve_path(
+                self.config.get("Bot", "local_dir_path", fallback="local"),
+                self.bot_root,
+            )
+        )
+        # Merge local config if present (user plugins/services settings)
+        local_config = self._local_root / "config.ini"
+        if local_config.exists():
+            self.config.read(local_config, encoding="utf-8")
+
     def _get_radio_settings(self) -> Dict[str, Any]:
         """Get current radio/connection settings from config.
         
@@ -340,6 +343,9 @@ class MeshCoreBot:
             
             # Reload the config
             self.config.read(self.config_file, encoding="utf-8")
+            local_config = self._local_root / "config.ini"
+            if local_config.exists():
+                self.config.read(local_config, encoding="utf-8")
             
             # Update rate limiters
             new_rate_limit = self.config.getint('Bot', 'rate_limit_seconds', fallback=10)
@@ -554,6 +560,8 @@ admin_commands = repeater
 # {rssi}: Received signal strength indicator in dBm
 # {timestamp}: Message timestamp in HH:MM:SS format
 # {path}: Message routing path (e.g., "01,5f (2 hops)")
+# {hops}: Total hop count only (e.g., "2" or "0"); same value as in path/connection_info
+# {hops_label}: Same as hops with "hop"/"hops" and pluralization (e.g., "1 hop", "2 hops")
 # {path_distance}: Total distance between all hops in path with locations (e.g., "123.4km (3 segs, 1 no-loc)")
 # {firstlast_distance}: Distance between first and last repeater in path (e.g., "45.6km" or empty if locations missing)
 test = "ack [@{sender}]{phrase_part} | {connection_info} | Received at: {timestamp}"
@@ -855,7 +863,12 @@ long_jokes = false
             
             if log_file:
                 try:
-                    file_handler = logging.FileHandler(log_file)
+                    file_handler = RotatingFileHandler(
+                        log_file,
+                        maxBytes=5 * 1024 * 1024,
+                        backupCount=3,
+                        encoding='utf-8',
+                    )
                     file_handler.setFormatter(formatter)
                     self.logger.addHandler(file_handler)
                 except (OSError, PermissionError) as e:
@@ -1355,8 +1368,21 @@ long_jokes = false
             except (AttributeError, TypeError):
                 print("Web viewer stopped")
         
+        # Wait for scheduler thread to exit (it checks self.connected)
+        if hasattr(self, 'scheduler') and self.scheduler and self.scheduler.scheduler_thread:
+            self.scheduler.join(timeout=5.0)
+        
         if self.meshcore:
-            await self.meshcore.disconnect()
+            disconnect_timeout = self.config.getfloat('Bot', 'disconnect_timeout_seconds', fallback=10.0)
+            try:
+                await asyncio.wait_for(self.meshcore.disconnect(), timeout=disconnect_timeout)
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "MeshCore disconnect timed out after %.1fs; continuing shutdown",
+                    disconnect_timeout,
+                )
+            except Exception as e:
+                self.logger.warning("Error during meshcore disconnect: %s", e)
         
         try:
             self.logger.info("Bot stopped")
@@ -1472,42 +1498,27 @@ long_jokes = false
     
     def _cleanup_web_viewer(self) -> None:
         """Cleanup web viewer resources on exit.
-        
+
         Called by atexit handler to ensure the web viewer process is terminated
         properly when the bot shuts down.
         """
         try:
             if hasattr(self, 'web_viewer_integration') and self.web_viewer_integration:
-                # Web viewer has simpler cleanup
                 self.web_viewer_integration.stop_viewer()
-                try:
-                    self.logger.info("Web viewer cleanup completed")
-                except (AttributeError, TypeError):
-                    print("Web viewer cleanup completed")
-        except (OSError, AttributeError, TypeError) as e:
-            try:
-                self.logger.error(f"Error during web viewer cleanup: {e}")
-            except (AttributeError, TypeError):
-                print(f"Error during web viewer cleanup: {e}")
+        except (OSError, AttributeError, TypeError, ValueError, IOError):
+            pass  # Do not log; stream may be closed during atexit
     
     def _cleanup_mesh_graph(self) -> None:
         """Cleanup mesh graph resources on exit.
-        
+
         Called by atexit handler to ensure graph state is persisted
         properly when the bot shuts down.
         """
         try:
             if hasattr(self, 'mesh_graph') and self.mesh_graph:
                 self.mesh_graph.shutdown()
-                try:
-                    self.logger.info("Mesh graph cleanup completed")
-                except (AttributeError, TypeError):
-                    print("Mesh graph cleanup completed")
-        except (OSError, AttributeError, TypeError) as e:
-            try:
-                self.logger.error(f"Error during mesh graph cleanup: {e}")
-            except (AttributeError, TypeError):
-                print(f"Error during mesh graph cleanup: {e}")
+        except (OSError, AttributeError, TypeError, ValueError, IOError):
+            pass  # Do not log; stream may be closed during atexit
     
     async def send_startup_advert(self) -> None:
         """Send a startup advertisement if configured.
@@ -1548,3 +1559,9 @@ long_jokes = false
             self.logger.error(f"Error sending startup advert: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
+
+    def key_prefix(self, public_key: str) -> str:
+        return public_key[:self.prefix_hex_chars]
+
+    def is_valid_prefix(self, prefix: str) -> bool:
+        return len(prefix) == self.prefix_hex_chars

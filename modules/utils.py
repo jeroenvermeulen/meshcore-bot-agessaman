@@ -10,8 +10,51 @@ import socket
 import asyncio
 import urllib.request
 import urllib.error
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Union, List, Any
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    ZoneInfo = None  # type: ignore[misc, assignment]
+    ZoneInfoNotFoundError = Exception  # type: ignore[misc, assignment]
+
+
+def is_valid_timezone(tz_str: str) -> bool:
+    """Return True if the string is a valid IANA timezone name."""
+    if not (tz_str and tz_str.strip()):
+        return False
+    if ZoneInfo is not None:
+        try:
+            ZoneInfo(tz_str.strip())
+            return True
+        except ZoneInfoNotFoundError:
+            return False
+    try:
+        import pytz
+        pytz.timezone(tz_str.strip())
+        return True
+    except Exception:
+        return False
+
+
+def get_config_timezone(config: Any, logger: Optional[Any] = None) -> Tuple[Any, str]:
+    """Resolve [Bot] timezone from config; fall back to system timezone if invalid or empty.
+
+    Returns:
+        (tz, iana_str): tz is a timezone object for datetime; iana_str is an IANA
+        string for APIs (e.g. OpenMeteo). When falling back to system, iana_str is "UTC".
+    """
+    timezone_str = (config.get('Bot', 'timezone', fallback='') or '').strip()
+    if timezone_str and is_valid_timezone(timezone_str):
+        import pytz
+        return (pytz.timezone(timezone_str), timezone_str)
+    if timezone_str and logger:
+        logger.warning("Invalid timezone '%s', using system timezone", timezone_str)
+    # System timezone for datetime; use "UTC" for API when we don't have an IANA name
+    tz = datetime.now().astimezone().tzinfo
+    return (tz, "UTC")
 
 
 def abbreviate_location(location: str, max_length: int = 20) -> str:
@@ -282,6 +325,33 @@ def get_major_city_queries(city: str, state_abbr: Optional[str] = None) -> List[
     return []
 
 
+def decode_path_len_byte(path_len_byte: int, max_path_size: int = 64) -> tuple:
+    """Decode the RF packet path_len byte per firmware (Packet.cpp).
+    
+    Encoding: low 6 bits = hop count, high 2 bits = size code.
+    bytes_per_hop = (path_len >> 6) + 1 → 1, 2, 3, or 4 (4 is reserved and invalid).
+    
+    Args:
+        path_len_byte: The single path_len byte from the packet.
+        max_path_size: Max path bytes (default 64, matches MAX_PATH_SIZE).
+        
+    Returns:
+        Tuple of (path_byte_length, bytes_per_hop). If encoding is invalid
+        (hash_size==4 or hop_count*bytes_per_hop > max_path_size), returns
+        (path_len_byte, 1) for legacy: path_len is raw byte count, 1 byte per hop.
+    """
+    hop_count = path_len_byte & 63
+    size_code = path_len_byte >> 6
+    bytes_per_hop = size_code + 1  # 1, 2, 3, or 4
+    if bytes_per_hop == 4:
+        # Reserved in firmware, invalid
+        return (path_len_byte, 1)
+    path_byte_length = hop_count * bytes_per_hop
+    if path_byte_length > max_path_size:
+        return (path_len_byte, 1)
+    return (path_byte_length, bytes_per_hop)
+
+
 def calculate_packet_hash(raw_hex: str, payload_type: int = None) -> str:
     """Calculate hash for packet identification - based on packet.cpp.
     
@@ -323,16 +393,16 @@ def calculate_packet_hash(raw_hex: str, payload_type: int = None) -> str:
         if len(byte_data) <= offset:
             return "0000000000000000"
         
-        # Read path_len (1 byte on wire, but stored as uint16_t in C++)
-        path_len = byte_data[offset]
+        path_len_byte = byte_data[offset]
         offset += 1
+        path_byte_length, _ = decode_path_len_byte(path_len_byte)
         
         # Validate we have enough bytes for the path
-        if len(byte_data) < offset + path_len:
+        if len(byte_data) < offset + path_byte_length:
             return "0000000000000000"
         
         # Skip past the path to get to payload
-        payload_start = offset + path_len
+        payload_start = offset + path_byte_length
         
         # Validate we have payload data
         if len(byte_data) <= payload_start:
@@ -351,7 +421,7 @@ def calculate_packet_hash(raw_hex: str, payload_type: int = None) -> str:
             # C++ does: sha.update(&path_len, sizeof(path_len))
             # path_len is uint16_t, so sizeof(path_len) = 2 bytes
             # Convert path_len to 2-byte little-endian uint16_t
-            hash_obj.update(path_len.to_bytes(2, byteorder='little'))
+            hash_obj.update(path_byte_length.to_bytes(2, byteorder='little'))
         
         hash_obj.update(payload_data)
         
@@ -1542,7 +1612,7 @@ async def check_internet_connectivity_async(host: str = "8.8.8.8", port: int = 5
         return False
 
 
-def parse_path_string(path_str: str) -> List[str]:
+def parse_path_string(path_str: str, prefix_hex_chars: int = 2) -> List[str]:
     """Parse a path string to extract node IDs.
     
     Handles various formats:
@@ -1553,9 +1623,10 @@ def parse_path_string(path_str: str) -> List[str]:
     
     Args:
         path_str: Path string in various formats.
+        prefix_hex_chars: Number of hex characters per node (2 = 1 byte, 4 = 2 bytes). Default 2.
         
     Returns:
-        List[str]: List of 2-character uppercase hex node IDs.
+        List[str]: List of uppercase hex node IDs (each of length prefix_hex_chars).
     """
     if not path_str:
         return []
@@ -1567,9 +1638,14 @@ def parse_path_string(path_str: str) -> List[str]:
     # Replace common separators with spaces
     path_str = path_str.replace(',', ' ').replace(':', ' ')
     
-    # Extract hex values using regex (2-character hex pairs)
-    hex_pattern = r'[0-9a-fA-F]{2}'
+    # Extract hex values using regex (prefix_hex_chars-wide hex tokens)
+    hex_pattern = rf'[0-9a-fA-F]{{{prefix_hex_chars}}}'
     hex_matches = re.findall(hex_pattern, path_str)
+    
+    # Legacy fallback: if configured length > 2 and no matches, retry with 2-char (1-byte) nodes
+    if not hex_matches and prefix_hex_chars > 2:
+        legacy_pattern = r'[0-9a-fA-F]{2}'
+        hex_matches = re.findall(legacy_pattern, path_str)
     
     # Convert to uppercase for consistency
     return [match.upper() for match in hex_matches]
@@ -1600,7 +1676,7 @@ def calculate_path_distances(bot: Any, path_str: str) -> Tuple[str, str]:
     
     try:
         # Parse node IDs from path string
-        node_ids = parse_path_string(path_str)
+        node_ids = parse_path_string(path_str, getattr(bot, 'prefix_hex_chars', 2))
         
         if len(node_ids) == 0:
             # No nodes parsed - likely direct connection
@@ -1952,7 +2028,8 @@ def format_elapsed_display(ts: Any, translator: Any = None) -> str:
         ts_f = float(ts)
     except (TypeError, ValueError):
         return _sync_str()
-    from datetime import UTC, datetime
+    from datetime import datetime, timezone
+    UTC = timezone.utc
     elapsed_ms = (datetime.now(UTC).timestamp() - ts_f) * 1000
     if elapsed_ms < 0 or elapsed_ms > _ELAPSED_MS_MAX:
         return _sync_str()
@@ -2015,25 +2092,34 @@ def format_keyword_response_with_placeholders(
             
             # Format timestamp
             try:
-                timezone_str = bot.config.get('Bot', 'timezone', fallback='')
-                if timezone_str:
-                    try:
-                        import pytz
-                        from datetime import datetime
-                        tz = pytz.timezone(timezone_str)
-                        dt = datetime.now(tz)
-                    except Exception:
-                        from datetime import datetime
-                        dt = datetime.now()
-                else:
-                    from datetime import datetime
-                    dt = datetime.now()
-                
+                tz, _ = get_config_timezone(bot.config, getattr(bot, 'logger', None))
+                dt = datetime.now(tz)
                 time_str = dt.strftime("%H:%M:%S")
             except Exception:
                 time_str = "Unknown"
             
             replacements['timestamp'] = time_str
+            
+            # Total hops: use message.hops when set, else parse from path string (e.g. "01,5f (2 hops)")
+            hops_val = getattr(message, 'hops', None)
+            if hops_val is not None and isinstance(hops_val, int):
+                replacements['hops'] = str(hops_val)
+            else:
+                path_str = message.path or ""
+                hop_match = re.search(r'\((\d+)\s*hops?', path_str, re.IGNORECASE)
+                if hop_match:
+                    replacements['hops'] = hop_match.group(1)
+                elif re.search(r'\bdirect\b|\b0\s*hops?\b', path_str, re.IGNORECASE):
+                    replacements['hops'] = "0"
+                else:
+                    replacements['hops'] = "?"
+            # Pluralized label: "1 hop", "2 hops", or "?" when unknown
+            h = replacements['hops']
+            if h == "?":
+                replacements['hops_label'] = "?"
+            else:
+                n = int(h)
+                replacements['hops_label'] = "1 hop" if n == 1 else f"{n} hops"
         else:
             # No message - use defaults for message-based placeholders
             replacements['sender'] = "Unknown"
@@ -2045,6 +2131,8 @@ def format_keyword_response_with_placeholders(
             replacements['path_distance'] = ""
             replacements['firstlast_distance'] = ""
             replacements['timestamp'] = "Unknown"
+            replacements['hops'] = "?"
+            replacements['hops_label'] = "?"
         
         # Mesh-info-based placeholders (from scheduled messages)
         if mesh_info:

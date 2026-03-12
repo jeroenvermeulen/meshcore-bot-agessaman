@@ -11,7 +11,7 @@ import pytz
 import re
 from ..models import MeshMessage
 from ..security_utils import validate_pubkey_format
-from ..utils import format_elapsed_display
+from ..utils import format_elapsed_display, get_config_timezone
 
 
 class BaseCommand(ABC):
@@ -463,6 +463,27 @@ class BaseCommand(ABC):
             self.logger.error(f"Failed to send response: {e}")
             return False
     
+    async def send_response_chunked(
+        self, message: MeshMessage, chunks: List[str], *, skip_user_rate_limit_first: bool = True
+    ) -> bool:
+        """Send multiple response messages (channel or DM) with rate-limit spacing.
+        
+        Args:
+            message: The message to respond to.
+            chunks: List of message strings to send in order.
+            skip_user_rate_limit_first: If True, skip user rate limit for first chunk too (default).
+            
+        Returns:
+            bool: True if all chunks were sent successfully, False on first failure.
+        """
+        try:
+            return await self.bot.command_manager.send_response_chunked(
+                message, chunks, skip_user_rate_limit_first=skip_user_rate_limit_first
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to send chunked response: {e}")
+            return False
+    
     def get_max_message_length(self, message: MeshMessage) -> int:
         """Calculate the maximum message length dynamically based on message type and bot username.
         
@@ -825,47 +846,41 @@ class BaseCommand(ABC):
         """Check if this command can execute right now (permissions, cooldown, etc.)"""
         return self.can_execute(message)
     
+    def get_path_display_string(self, message: MeshMessage) -> str:
+        """Get path string for display (test/ack placeholders). Prefers message.routing_info for multi-byte and direct."""
+        routing_info = getattr(message, 'routing_info', None)
+        if routing_info is not None:
+            path_length = routing_info.get('path_length', 0)
+            if path_length == 0:
+                return "Direct"
+            path_nodes = routing_info.get('path_nodes', [])
+            if path_nodes:
+                path_str = ','.join(str(n).lower() for n in path_nodes)
+                return f"{path_str} ({len(path_nodes)} hops)"
+        if not message.path:
+            return "Unknown"
+        path_string = message.path
+        if " via ROUTE_TYPE_" in path_string:
+            path_string = path_string.split(" via ROUTE_TYPE_")[0]
+        return path_string.strip() or "Unknown"
+
     def build_enhanced_connection_info(self, message: MeshMessage) -> str:
-        """Build enhanced connection info with SNR, RSSI, and parsed route information"""
-        # Extract just the hops and path info without the route type
-        routing_info = message.path or "Unknown routing"
-        
-        # Clean up the routing info to remove the "via ROUTE_TYPE_*" part
-        if "via ROUTE_TYPE_" in routing_info:
-            # Extract just the hops and path part
-            parts = routing_info.split(" via ROUTE_TYPE_")
-            if len(parts) > 0:
-                routing_info = parts[0]
-        
-        # Add SNR and RSSI
+        """Build enhanced connection info with SNR, RSSI, and parsed route information.
+        Uses message.routing_info when present (multi-byte path, direct) for path part.
+        """
+        path_part = self.get_path_display_string(message)
         snr_info = f"SNR: {message.snr or 'Unknown'} dB"
         rssi_info = f"RSSI: {message.rssi or 'Unknown'} dBm"
-        
-        # Build enhanced connection info
-        connection_info = f"{routing_info} | {snr_info} | {rssi_info}"
-        
+        connection_info = f"{path_part} | {snr_info} | {rssi_info}"
         return connection_info
     
     def format_timestamp(self, message: MeshMessage) -> str:
         """Format current bot time for display (not sender's timestamp to avoid clock issues)"""
         try:
-            # Get configured timezone or use system timezone
-            timezone_str = self.bot.config.get('Bot', 'timezone', fallback='')
-            
-            if timezone_str:
-                try:
-                    # Use configured timezone
-                    tz = pytz.timezone(timezone_str)
-                    dt = datetime.now(tz)
-                except pytz.exceptions.UnknownTimeZoneError:
-                    # Fallback to system timezone if configured timezone is invalid
-                    dt = datetime.now()
-            else:
-                # Use system timezone
-                dt = datetime.now()
-            
+            tz, _ = get_config_timezone(self.bot.config, self.logger)
+            dt = datetime.now(tz)
             return dt.strftime("%H:%M:%S")
-        except:
+        except Exception:
             return "Unknown"
     
     def format_elapsed(self, message: MeshMessage) -> str:

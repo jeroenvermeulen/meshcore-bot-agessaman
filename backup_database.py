@@ -8,6 +8,7 @@ import sqlite3
 import shutil
 import os
 import sys
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -43,15 +44,9 @@ def backup_database(db_path, backup_dir="backups"):
     
     try:
         # Use SQLite backup API for proper backup (handles WAL files correctly)
-        source_conn = sqlite3.connect(str(db_path))
-        backup_conn = sqlite3.connect(str(backup_file))
-        
-        # Perform the backup
-        source_conn.backup(backup_conn)
-        
-        # Close connections
-        backup_conn.close()
-        source_conn.close()
+        with closing(sqlite3.connect(str(db_path))) as source_conn, closing(sqlite3.connect(str(backup_file))) as backup_conn:
+            # Perform the backup
+            source_conn.backup(backup_conn)
         
         # Get file size for reporting
         file_size = backup_file.stat().st_size
@@ -92,14 +87,13 @@ def check_database_status(db_path):
     
     try:
         conn = sqlite3.connect(str(db_path))
-        cursor = conn.cursor()
-        
-        # Get list of tables
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = cursor.fetchall()
-        table_count = len(tables)
-        
-        conn.close()
+        with closing(conn):
+            cursor = conn.cursor()
+            
+            # Get list of tables
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = cursor.fetchall()
+            table_count = len(tables)
         
         # Consider database used if it has tables or is larger than 1KB
         is_used = table_count > 0 or file_size_mb > 0.001

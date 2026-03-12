@@ -14,8 +14,9 @@ from meshcore import EventType
 
 from .models import MeshMessage
 from .enums import PayloadType, PayloadVersion, RouteType, AdvertFlags, DeviceRole
-from .utils import calculate_packet_hash, format_elapsed_display
+from .utils import calculate_packet_hash, format_elapsed_display, decode_path_len_byte
 from .security_utils import sanitize_input
+from .graph_trace_helper import update_mesh_graph_from_trace_data
 
 
 class MessageHandler:
@@ -134,16 +135,19 @@ class MessageHandler:
                                 out_path_len = contact_data.get('out_path_len', -1)
                                 
                                 if out_path and out_path_len > 0:
-                                    # Convert hex path to readable node IDs using first 2 chars of pubkey
+                                    # Chunk by bytes_per_hop (multi-byte path support); derive if not stored
                                     try:
-                                        path_bytes = bytes.fromhex(out_path)
-                                        path_nodes = []
-                                        for i in range(0, len(path_bytes), 2):
-                                            if i + 1 < len(path_bytes):
-                                                node_id = int.from_bytes(path_bytes[i:i+2], byteorder='little')
-                                                # Convert to 2-character hex representation
-                                                path_nodes.append(f"{node_id:02x}")
-                                        
+                                        bph = contact_data.get('out_bytes_per_hop')
+                                        if bph is None and out_path_len > 0:
+                                            byte_len = len(out_path) // 2
+                                            if byte_len > 0 and (byte_len % out_path_len) == 0:
+                                                bph = byte_len // out_path_len
+                                            else:
+                                                bph = 1
+                                        hex_chars = (bph or 1) * 2
+                                        path_nodes = [out_path[i:i + hex_chars].lower() for i in range(0, len(out_path), hex_chars)]
+                                        if (len(out_path) % hex_chars) != 0 or not path_nodes:
+                                            path_nodes = [out_path[i:i + 2].lower() for i in range(0, len(out_path), 2)]
                                         path_info = f"{','.join(path_nodes)} ({out_path_len} hops)"
                                         self.logger.debug(f"Found path info: {path_info}")
                                     except Exception as e:
@@ -356,11 +360,18 @@ class MessageHandler:
             )
             
             # Always decode and log path information for debugging (regardless of keywords)
-            recent_rf_data = self.find_recent_rf_data()
+            # Use same correlation as above so we attach this DM's path, not another packet's
+            if message_packet_prefix:
+                recent_rf_data = self.find_recent_rf_data(message_packet_prefix)
+            elif message_pubkey:
+                recent_rf_data = self.find_recent_rf_data(message_pubkey)
+            else:
+                recent_rf_data = self.find_recent_rf_data()
             
             # If we have RF data with routing information, update the path with that instead
             if recent_rf_data and recent_rf_data.get('routing_info'):
                 rf_routing = recent_rf_data['routing_info']
+                message.routing_info = rf_routing  # Path command uses this for multi-byte path (no re-parse)
                 if rf_routing.get('path_length', 0) > 0:
                     path_nodes = rf_routing.get('path_nodes', [])
                     route_type = rf_routing.get('route_type', 'Unknown')
@@ -533,18 +544,20 @@ class MessageHandler:
                 if out_path_len >= 0:
                     advert_data['out_path'] = out_path
                     advert_data['out_path_len'] = out_path_len
+                    advert_data['out_bytes_per_hop'] = packet_info.get('bytes_per_hop', 1)
                 
                 # Update mesh graph with edges from the advert path (one edge per hop).
                 # This can trigger many send_mesh_edge_update() calls in quick succession;
                 # if the web viewer is down, that produces a wave of connection-refused logs.
+                path_byte_length = packet_info.get('path_byte_length') or (len(out_path) // 2 if out_path else 0)
                 if (out_path and out_path_len > 0
                         and hasattr(self.bot, 'mesh_graph') and self.bot.mesh_graph
                         and self.bot.mesh_graph.capture_enabled):
-                    self._update_mesh_graph_from_advert(advert_data, out_path, out_path_len, packet_info)
+                    self._update_mesh_graph_from_advert(advert_data, out_path, path_byte_length, packet_info)
                 
                 # Store complete path in observed_paths table
                 if out_path and out_path_len > 0:
-                    self._store_observed_path(advert_data, out_path, out_path_len, 'advert', packet_hash=packet_hash)
+                    self._store_observed_path(advert_data, out_path, path_byte_length, 'advert', packet_hash=packet_hash, bytes_per_hop=packet_info.get('bytes_per_hop', 1))
                 
                 # Track this advertisement in the complete database
                 if hasattr(self.bot, 'repeater_manager'):
@@ -703,7 +716,7 @@ class MessageHandler:
                                 
                                 # If we don't have path_nodes but have path_hex, convert it
                                 if not path_nodes and path_hex and len(path_hex) >= 2:
-                                    path_nodes = [path_hex[i:i+2] for i in range(0, len(path_hex), 2)]
+                                    path_nodes = self._path_hex_to_nodes(path_hex)
                                 
                                 path_string = ','.join(path_nodes) if path_nodes else None
                                 
@@ -742,6 +755,8 @@ class MessageHandler:
                             
                             routing_info = {
                                 'path_length': decoded_packet.get('path_len', 0),
+                                'path_byte_length': decoded_packet.get('path_byte_length'),
+                                'bytes_per_hop': decoded_packet.get('bytes_per_hop', 1),
                                 'path_hex': decoded_packet.get('path_hex', ''),
                                 'path_nodes': decoded_packet.get('path', []),
                                 'route_type': decoded_packet.get('route_type_name', 'Unknown'),
@@ -749,13 +764,41 @@ class MessageHandler:
                                 'payload_type': decoded_packet.get('payload_type_name', 'Unknown'),
                                 'packet_hash': packet_hash  # Store hash for packet tracking
                             }
-                            
+                            # Validate path consistency (path_byte_length, path_hex, path_nodes, bytes_per_hop)
+                            path_len = routing_info['path_length']
+                            path_byte_len = routing_info.get('path_byte_length')
+                            path_hex_str = routing_info.get('path_hex', '')
+                            path_nodes_list = routing_info.get('path_nodes') or []
+                            bph = routing_info.get('bytes_per_hop', 1) or 1
+                            expected_hex_len = (path_byte_len * 2) if path_byte_len is not None else (path_len * bph * 2)
+                            if path_len > 0 and path_hex_str:
+                                if len(path_hex_str) != expected_hex_len:
+                                    self.logger.warning(
+                                        "Path length mismatch: path_hex has %d hex chars, expected %d (path_byte_length=%s, path_length=%s, bytes_per_hop=%s)",
+                                        len(path_hex_str), expected_hex_len, path_byte_len, path_len, bph
+                                    )
+                                if path_nodes_list and len(path_nodes_list) != path_len:
+                                    self.logger.warning(
+                                        "Path nodes count mismatch: %d nodes, path_length=%d",
+                                        len(path_nodes_list), path_len
+                                    )
+                                if path_nodes_list and bph >= 1 and any(len(str(n)) != bph * 2 for n in path_nodes_list):
+                                    self.logger.warning(
+                                        "Path node width mismatch: bytes_per_hop=%d expects %d hex chars per node, nodes=%s",
+                                        bph, bph * 2, path_nodes_list[:5]
+                                    )
                             # Log the routing information for analysis
                             if routing_info['path_length'] > 0:
-                                # Format path with comma separation (every 2 characters)
-                                path_hex = routing_info['path_hex']
-                                formatted_path = ','.join([path_hex[i:i+2] for i in range(0, len(path_hex), 2)])
-                                log_message = f"🛣️  ROUTING INFO: {routing_info['route_type']} | Path: {formatted_path} ({routing_info['path_length']} bytes) | Payload: {routing_info['payload_length']} bytes | Type: {routing_info['payload_type']}"
+                                # Use path_nodes when present (multi-byte); else chunk path_hex
+                                path_nodes_list = routing_info.get('path_nodes') or []
+                                if path_nodes_list:
+                                    formatted_path = ','.join(str(n).lower() for n in path_nodes_list)
+                                else:
+                                    path_hex = routing_info['path_hex']
+                                    path_nodes_fmt = self._path_hex_to_nodes(path_hex)
+                                    formatted_path = ','.join(path_nodes_fmt)
+                                path_bytes_str = decoded_packet.get('path_byte_length', routing_info['path_length'])
+                                log_message = f"🛣️  ROUTING INFO: {routing_info['route_type']} | Path: {formatted_path} ({routing_info['path_length']} hops, {path_bytes_str} bytes) | Payload: {routing_info['payload_length']} bytes | Type: {routing_info['payload_type']}"
                                 self.logger.info(log_message)
                             else:
                                 log_message = f"📡 DIRECT MESSAGE: {routing_info['route_type']} | Type: {routing_info['payload_type']}"
@@ -1143,17 +1186,19 @@ class MessageHandler:
                 self.logger.error(f"Packet too short for path_len at offset {offset}: {len(byte_data)} bytes")
                 return None
             
-            path_len = byte_data[offset]
+            path_len_byte = byte_data[offset]
             offset += 1
+            # Decode per firmware: low 6 bits = hop count, high 2 bits = size code (bytes_per_hop = code+1)
+            path_byte_length, bytes_per_hop = decode_path_len_byte(path_len_byte)
             
             # Check if we have enough data for the full path
-            if len(byte_data) < offset + path_len:
-                self.logger.error(f"Packet too short for path (need {offset + path_len}, have {len(byte_data)})")
+            if len(byte_data) < offset + path_byte_length:
+                self.logger.error(f"Packet too short for path (need {offset + path_byte_length}, have {len(byte_data)})")
                 return None
             
             # Extract path
-            path_bytes = byte_data[offset:offset + path_len]
-            offset += path_len
+            path_bytes = byte_data[offset:offset + path_byte_length]
+            offset += path_byte_length
             
             # Remaining data is payload
             payload = byte_data[offset:]
@@ -1169,13 +1214,8 @@ class MessageHandler:
             # Extract payload type (bits 2-5)
             payload_type = PayloadType((header >> 2) & 0x0F)
 
-            # Convert path to list of hex values
-            path_hex = path_bytes.hex()
-            path_values = []
-            i = 0
-            while i < len(path_hex):
-                path_values.append(path_hex[i:i+2])
-                i += 2
+            # Chunk path by bytes_per_hop from packet (1, 2, or 3; legacy fallback uses 1)
+            path_hex, path_values = self._path_bytes_to_nodes(path_bytes, prefix_hex_chars=bytes_per_hop * 2)
             
             # Process path based on packet type
             path_info = self._process_packet_path(
@@ -1211,7 +1251,9 @@ class MessageHandler:
                 'has_transport_codes': has_transport,
                 'transport_codes': transport_codes,
                 'transport_size': 4 if has_transport else 0,
-                'path_len': path_len,
+                'path_len': len(path_values),  # Hop count for display / routing_info
+                'path_byte_length': path_byte_length,  # Path bytes (for logs showing "X bytes")
+                'bytes_per_hop': bytes_per_hop,  # For multi-byte path storage/retrieval
                 'path_info': path_info,
                 'path': path_values,  # For backward compatibility
                 'path_hex': path_hex,
@@ -1325,6 +1367,90 @@ class MessageHandler:
             self.logger.error(f"Error parsing ADVERT payload: {e}", exc_info=True)
             return {}
 
+    def _path_bytes_to_nodes(self, path_bytes: bytes, prefix_hex_chars: int = None) -> tuple:
+        """Chunk path bytes into hex node IDs using configured prefix length, with legacy 2-char fallback.
+        
+        Args:
+            path_bytes: Raw path bytes from packet.
+            prefix_hex_chars: Hex chars per node (2 = 1 byte, 4 = 2 bytes). Default from bot.prefix_hex_chars.
+            
+        Returns:
+            Tuple of (path_hex_str, path_nodes_list).
+        """
+        n = prefix_hex_chars if prefix_hex_chars is not None else getattr(self.bot, 'prefix_hex_chars', 2)
+        if n <= 0:
+            n = 2
+        path_hex = path_bytes.hex()
+        nodes = [path_hex[i:i + n].upper() for i in range(0, len(path_hex), n)]
+        # Legacy fallback: if remainder or no nodes, treat as 1-byte-per-hop
+        if (len(path_hex) % n) != 0 or not nodes:
+            nodes = [path_hex[i:i + 2].upper() for i in range(0, len(path_hex), 2)]
+        return path_hex, nodes
+
+    def _path_hex_to_nodes(self, path_hex: str) -> List[str]:
+        """Chunk path_hex string into node list using configured prefix length, with legacy 2-char fallback.
+        
+        Use when path_hex comes from decoded packet path data (so chunk size should match decode layer).
+        """
+        if not path_hex or len(path_hex) < 2:
+            return []
+        n = getattr(self.bot, 'prefix_hex_chars', 2)
+        if n <= 0:
+            n = 2
+        nodes = [path_hex[i:i + n].lower() for i in range(0, len(path_hex), n)]
+        if (len(path_hex) % n) != 0 or not nodes:
+            nodes = [path_hex[i:i + 2].lower() for i in range(0, len(path_hex), 2)]
+        return nodes
+
+    def _get_path_from_rf_data(
+        self,
+        rf_data: Dict[str, Any],
+        payload_hex: Optional[str] = None,
+        packet_info: Optional[Dict[str, Any]] = None
+    ) -> Tuple[Optional[str], Optional[List[str]], int]:
+        """Get path string, path nodes, and hop count from RF data (single source for path extraction).
+        
+        Prefers routing_info.path_nodes when present (no re-decode; correct multi-byte).
+        Otherwise decodes (or uses provided packet_info) and gets path from decoder's 'path'
+        or chunks path_hex using bytes_per_hop from the packet.
+        
+        Returns:
+            (path_string, path_nodes, hops). path_nodes is a list for mesh graph; hops is path_length or 255.
+        """
+        routing_info = rf_data.get('routing_info') or {}
+        path_nodes_list = routing_info.get('path_nodes')
+        if path_nodes_list:
+            path_str = ','.join(str(n).lower() for n in path_nodes_list)
+            return (path_str, list(path_nodes_list), len(path_nodes_list))
+        raw_hex = rf_data.get('raw_hex')
+        if not raw_hex:
+            return (None, None, 255)
+        if packet_info is None:
+            payload = payload_hex or rf_data.get('payload')
+            packet_info = self.decode_meshcore_packet(raw_hex, payload)
+        if not packet_info:
+            return (None, None, 255)
+        hops = packet_info.get('path_len', 255)
+        path_nodes_list = packet_info.get('path_nodes') or packet_info.get('path') or []
+        if path_nodes_list:
+            path_str = ','.join(str(n).lower() for n in path_nodes_list)
+            return (path_str, list(path_nodes_list), len(path_nodes_list))
+        path_hex = packet_info.get('path_hex', '')
+        if path_hex and len(path_hex) >= 2:
+            bytes_per_hop = packet_info.get('bytes_per_hop', 1)
+            n = (bytes_per_hop * 2) if bytes_per_hop and bytes_per_hop >= 1 else 2
+            path_nodes_list = [path_hex[i:i + n].lower() for i in range(0, len(path_hex), n)]
+            if (len(path_hex) % n) != 0:
+                path_nodes_list = [path_hex[i:i + 2].lower() for i in range(0, len(path_hex), 2)]
+            if path_nodes_list:
+                return (','.join(path_nodes_list), path_nodes_list, len(path_nodes_list))
+        path_info = packet_info.get('path_info') or {}
+        path_nodes_list = path_info.get('path') or []
+        if path_nodes_list:
+            path_str = ','.join(str(n).lower() for n in path_nodes_list)
+            return (path_str, list(path_nodes_list), len(path_nodes_list))
+        return (None, None, hops)
+
     def _process_packet_path(self, path_bytes: bytes, payload: bytes, 
                              route_type: RouteType, payload_type: PayloadType) -> dict:
         """
@@ -1340,8 +1466,8 @@ class MessageHandler:
             dict: Processed path information
         """
         try:
-            # Convert path bytes to hex node IDs
-            path_nodes = [f"{b:02x}" for b in path_bytes]
+            # Chunk path bytes into node IDs using configured prefix length (with legacy fallback)
+            _, path_nodes = self._path_bytes_to_nodes(path_bytes)
             
             # Special handling for TRACE packets
             if payload_type == PayloadType.TRACE:
@@ -1354,15 +1480,26 @@ class MessageHandler:
                     snr_values.append(snr_db)
                 
                 # Decode trace payload to extract pathHashes (routing path)
+                # path_hash_len from flags (bits 0-1): 1 << (flags & 3) = 1, 2, 4, or 8 bytes per hop
                 path_hashes = []
                 if len(payload) >= 9:  # Minimum: tag(4) + auth(4) + flags(1)
                     try:
-                        # Skip tag(4) + auth(4) + flags(1) = 9 bytes
                         path_hashes_bytes = payload[9:]
-                        # Each byte is a node hash (1-byte prefix)
-                        path_hashes = [f"{b:02x}" for b in path_hashes_bytes]
+                        flags = payload[8]
+                        path_hash_len = 1 << (flags & 3)  # 1, 2, 4, or 8 bytes per hop
+                        if path_hash_len <= 0:
+                            path_hash_len = 1
+                        if len(path_hashes_bytes) % path_hash_len == 0:
+                            path_hashes = [
+                                path_hashes_bytes[i:i + path_hash_len].hex().upper()
+                                for i in range(0, len(path_hashes_bytes), path_hash_len)
+                            ]
+                        else:
+                            # Fallback: 1 byte per hop (legacy)
+                            path_hashes = [f"{b:02x}".upper() for b in path_hashes_bytes]
                     except Exception as e:
                         self.logger.debug(f"Error extracting pathHashes from trace payload: {e}")
+                        path_hashes = [f"{b:02x}".upper() for b in payload[9:]]
                 
                 return {
                     'type': 'trace',
@@ -1397,8 +1534,8 @@ class MessageHandler:
                 
         except Exception as e:
             self.logger.error(f"Error processing packet path: {e}")
-            # Return basic path info as fallback
-            path_nodes = [f"{b:02x}" for b in path_bytes]
+            # Return basic path info as fallback (legacy 1-byte-per-hop)
+            _, path_nodes = self._path_bytes_to_nodes(path_bytes, prefix_hex_chars=2)
             return {
                 'type': 'unknown',
                 'path': path_nodes,
@@ -1576,97 +1713,45 @@ class MessageHandler:
                     rssi = recent_rf_data['rssi']
                     self.logger.debug(f"Using RSSI from RF data: {rssi}")
                 
-                # Try to extract path information from raw hex directly
+                # Single path source: prefer routing_info, else decode/fallback via helper
                 path_string = None
                 hops = payload.get('path_len', 255)
-                
-                # First try the packet decoder
-                # Use payload field if available, otherwise use raw_hex
                 payload_hex = recent_rf_data.get('payload')
                 packet_info = self.decode_meshcore_packet(raw_hex, payload_hex)
-                
-                # Get packet_hash from recent_rf_data if available (for trace correlation)
                 packet_hash = recent_rf_data.get('packet_hash')
                 if packet_hash and packet_info:
                     packet_info['packet_hash'] = packet_hash
-                
                 if packet_info and packet_info.get('path_len') is not None:
-                    # Valid packet decoded - use the results even if path is empty (0 hops = direct)
                     hops = packet_info.get('path_len', 0)
-                    
-                    # Check if this is a TRACE packet with SNR data
                     if packet_info.get('payload_type') == 9:  # TRACE packet
-                        # For TRACE packets, extract routing path from payload pathHashes
-                        # The path field contains SNR data, but the actual routing path is in payload
                         path_info = packet_info.get('path_info', {})
                         path_hashes = path_info.get('path_hashes') or path_info.get('path', [])
-                        
                         if path_hashes:
-                            # Convert pathHashes to path string
                             path_string = ','.join(path_hashes)
-                            self.logger.info(f"🎯 EXTRACTED PATH FROM TRACE PACKET: {path_string} ({len(path_hashes)} hops)")
-                            
-                            # Update mesh graph with trace path - bot is the destination, so we can confirm these edges
-                            # Since the bot received this trace packet, it's the destination node
+                            self.logger.debug(f"Path from TRACE packet: {path_string} ({len(path_hashes)} hops)")
                             if hasattr(self.bot, 'mesh_graph') and self.bot.mesh_graph and self.bot.mesh_graph.capture_enabled:
                                 self._update_mesh_graph_from_trace(path_hashes, packet_info)
                         else:
                             path_string = "Direct" if hops == 0 else f"Unknown routing ({hops} hops)"
-                            self.logger.info(f"🎯 EXTRACTED PATH FROM TRACE PACKET: {path_string}")
+                            self.logger.debug(f"Path from TRACE packet: {path_string}")
                     else:
-                        # For all other packet types, try multiple methods to get the path
-                        path_string = None
-                        
-                        # Method 1: Try path_nodes field first
-                        path_nodes = packet_info.get('path_nodes', [])
-                        if path_nodes:
-                            path_string = ','.join(path_nodes)
-                            self.logger.info(f"🎯 EXTRACTED PATH FROM PACKET: {path_string} ({hops} hops)")
-                            # Update mesh graph with path edges
-                            if hasattr(self.bot, 'mesh_graph') and self.bot.mesh_graph and self.bot.mesh_graph.capture_enabled:
-                                self._update_mesh_graph(path_nodes, packet_info)
-                        else:
-                            # Method 2: Try path_hex field
-                            path_hex = packet_info.get('path_hex', '')
-                            if path_hex and len(path_hex) >= 2:
-                                # Convert hex string to node list (every 2 characters = 1 node)
-                                path_nodes = [path_hex[i:i+2] for i in range(0, len(path_hex), 2)]
-                                path_string = ','.join(path_nodes)
-                                self.logger.info(f"🎯 EXTRACTED PATH FROM PACKET HEX: {path_string} ({hops} hops)")
-                                # Update mesh graph with path edges
-                                if hasattr(self.bot, 'mesh_graph') and self.bot.mesh_graph and self.bot.mesh_graph.capture_enabled:
-                                    self._update_mesh_graph(path_nodes, packet_info)
-                            else:
-                                # Method 3: Try path_info.path field
-                                path_info = packet_info.get('path_info', {})
-                                if path_info and path_info.get('path'):
-                                    path_nodes = path_info['path']
-                                    path_string = ','.join(path_nodes)
-                                    self.logger.info(f"🎯 EXTRACTED PATH FROM PATH_INFO: {path_string} ({hops} hops)")
-                                    # Update mesh graph with path edges
-                                    if hasattr(self.bot, 'mesh_graph') and self.bot.mesh_graph and self.bot.mesh_graph.capture_enabled:
-                                        self._update_mesh_graph(path_nodes, packet_info)
-                                else:
-                                    # No path found - this is truly unknown
-                                    path_string = "Direct" if hops == 0 else "Unknown routing"
-                                    self.logger.info(f"🎯 EXTRACTED PATH FROM PACKET: {path_string} ({hops} hops)")
+                        had_routing_nodes = bool((recent_rf_data.get('routing_info') or {}).get('path_nodes'))
+                        path_string, path_nodes, hops = self._get_path_from_rf_data(
+                            recent_rf_data, payload_hex=payload_hex, packet_info=packet_info
+                        )
+                        if path_string and path_nodes and hasattr(self.bot, 'mesh_graph') and self.bot.mesh_graph and self.bot.mesh_graph.capture_enabled:
+                            self._update_mesh_graph(path_nodes, packet_info)
+                        if path_string and not had_routing_nodes:
+                            self.logger.debug(f"Path from fallback decode: {path_string} ({hops} hops)")
                 else:
-                    # Packet decoding failed - try to extract path directly from raw hex
-                    self.logger.debug("Packet decoding failed, trying direct hex parsing")
+                    self.logger.debug("Packet decoding failed, trying direct hex or routing_info fallback")
                     path_string = self.extract_path_from_raw_hex(raw_hex, hops)
-                    if path_string:
-                        self.logger.info(f"🎯 EXTRACTED PATH FROM RAW HEX: {path_string} ({hops} hops)")
-                    else:
-                        # Try to use routing info from RF data as fallback
-                        if recent_rf_data.get('routing_info') and recent_rf_data['routing_info'].get('path_nodes'):
-                            routing_info = recent_rf_data['routing_info']
-                            hops = len(routing_info['path_nodes'])
-                            path_string = ','.join(routing_info['path_nodes'])
-                            self.logger.info(f"🎯 EXTRACTED PATH FROM RF ROUTING INFO: {path_string} ({hops} hops)")
-                        else:
-                            # Final fallback to basic path info
-                            self.logger.debug("No path info available, using basic path info")
-                            path_string = None
+                    if not path_string and recent_rf_data.get('routing_info') and recent_rf_data['routing_info'].get('path_nodes'):
+                        routing_info = recent_rf_data['routing_info']
+                        path_nodes = routing_info['path_nodes']
+                        hops = len(path_nodes)
+                        path_string = ','.join(str(n).lower() for n in path_nodes)
+                        self.logger.debug(f"Path from RF routing_info fallback: {path_string} ({hops} hops)")
             else:
                 self.logger.warning("❌ NO RF DATA found for channel message after all correlation attempts")
                 hops = payload.get('path_len', 255)
@@ -1700,6 +1785,8 @@ class MessageHandler:
                 elapsed=_elapsed,
                 is_dm=False
             )
+            if recent_rf_data and recent_rf_data.get('routing_info'):
+                message.routing_info = recent_rf_data['routing_info']
             
             # Path information is now set directly in the MeshMessage constructor from RF data
             # No need for additional path extraction since we're using the actual routing data
@@ -1730,9 +1817,13 @@ class MessageHandler:
     
     def _update_mesh_graph(self, path_nodes: List[str], packet_info: Dict[str, Any]):
         """Update mesh graph with edges from a message path.
-        
+
+        path_nodes may be 2, 4, or 6 hex chars per node depending on the packet's
+        bytes_per_hop (sender setting). add_edge stores at the resolution provided;
+        no truncation, so distinct links (e.g. 7e42→8611 and 7e99→86ff) stay separate.
+
         Args:
-            path_nodes: List of node prefixes in path order.
+            path_nodes: List of node prefixes in path order (length per node from packet's bytes_per_hop).
             packet_info: Packet information dictionary with routing data.
         """
         if not path_nodes or len(path_nodes) < 2:
@@ -1877,7 +1968,7 @@ class MessageHandler:
                 geographic_distance=geographic_distance
             )
     
-    def _store_observed_path(self, advert_data: Dict[str, Any], path_hex: str, path_length: int, packet_type: str, packet_hash: Optional[str] = None):
+    def _store_observed_path(self, advert_data: Dict[str, Any], path_hex: str, path_length: int, packet_type: str, packet_hash: Optional[str] = None, bytes_per_hop: Optional[int] = None):
         """Store a complete path in the observed_paths table.
         
         Args:
@@ -1886,16 +1977,20 @@ class MessageHandler:
             path_length: Length of the path in bytes.
             packet_type: Type of packet ('advert', 'message', etc.).
             packet_hash: Optional packet hash to group paths from the same packet.
+            bytes_per_hop: Optional bytes per hop (1, 2, or 3) for multi-byte path decode; None = legacy 1.
         """
         if not path_hex or path_length < 2:
             return  # Need at least 2 bytes (1 node) to form a path
         
         try:
-            # Parse path to extract from_prefix and to_prefix
-            path_nodes = []
-            for i in range(0, len(path_hex), 2):
-                if i + 1 < len(path_hex):
-                    path_nodes.append(path_hex[i:i+2].lower())
+            # Parse path to extract from_prefix and to_prefix (use bytes_per_hop when provided for multi-byte paths)
+            hex_chars = (bytes_per_hop or 1) * 2
+            if bytes_per_hop is not None and bytes_per_hop > 0:
+                path_nodes = [path_hex[i:i + hex_chars].lower() for i in range(0, len(path_hex), hex_chars)]
+                if (len(path_hex) % hex_chars) != 0 or not path_nodes:
+                    path_nodes = [path_hex[i:i + 2].lower() for i in range(0, len(path_hex), 2)]
+            else:
+                path_nodes = self._path_hex_to_nodes(path_hex)
             
             if len(path_nodes) < 1:
                 return  # No valid path nodes
@@ -1943,8 +2038,8 @@ class MessageHandler:
                 # New path - insert
                 insert_query = '''
                     INSERT INTO observed_paths
-                    (public_key, packet_hash, from_prefix, to_prefix, path_hex, path_length, packet_type, first_seen, last_seen, observation_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    (public_key, packet_hash, from_prefix, to_prefix, path_hex, path_length, bytes_per_hop, packet_type, first_seen, last_seen, observation_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 '''
                 # Only store packet_hash if it's valid (not None and not the default invalid hash)
                 stored_packet_hash = packet_hash if (packet_hash and packet_hash != "0000000000000000") else None
@@ -1955,6 +2050,7 @@ class MessageHandler:
                     to_prefix,
                     path_hex,
                     path_length,
+                    bytes_per_hop,
                     packet_type,
                     now.isoformat(),
                     now.isoformat()
@@ -2045,13 +2141,14 @@ class MessageHandler:
             self.logger.debug("Mesh graph: No public key in advert data, skipping graph update")
             return
         
-        advertiser_prefix = advertiser_key[:2].lower()
+        advertiser_prefix = advertiser_key[:self.bot.prefix_hex_chars].lower()
         
-        # Parse path from hex string
+        # Parse path from hex string (use bytes_per_hop from packet for multi-byte paths)
+        hex_chars = (packet_info.get('bytes_per_hop') or 1) * 2
         path_nodes = []
-        for i in range(0, len(out_path), 2):
-            if i + 1 < len(out_path):
-                path_nodes.append(out_path[i:i+2].lower())
+        for i in range(0, len(out_path), hex_chars):
+            if i + hex_chars <= len(out_path):
+                path_nodes.append(out_path[i:i + hex_chars].lower())
         
         if len(path_nodes) == 0:
             return  # No valid path nodes
@@ -2301,320 +2398,8 @@ class MessageHandler:
             )
     
     def _update_mesh_graph_from_trace(self, path_hashes: List[str], packet_info: Dict[str, Any]):
-        """Update mesh graph with edges from a trace packet's pathHashes.
-        
-        When the bot receives a trace packet, it's the destination, so we can confirm
-        the edges in the path. The pathHashes represent the routing path the packet took.
-        
-        Special case: If this is a trace we sent that came back through an immediate neighbor,
-        we can trust both directions (Bot -> Neighbor and Neighbor -> Bot).
-        
-        Args:
-            path_hashes: List of node hash prefixes (1-byte each, as 2-char hex strings) from trace payload.
-            packet_info: Packet information dictionary with routing data.
-        """
-        if not path_hashes or len(path_hashes) == 0:
-            self.logger.debug("Mesh graph: Trace packet has no pathHashes, skipping graph update")
-            return
-        
-        if not hasattr(self.bot, 'mesh_graph') or not self.bot.mesh_graph:
-            self.logger.debug("Mesh graph: Graph not initialized, skipping trace update")
-            return
-        
-        if not hasattr(self.bot, 'transmission_tracker') or not self.bot.transmission_tracker:
-            self.logger.debug("Mesh graph: Cannot get bot prefix, skipping trace update")
-            return
-        
-        mesh_graph = self.bot.mesh_graph
-        bot_prefix = self.bot.transmission_tracker.bot_prefix
-        
-        if not bot_prefix:
-            self.logger.debug("Mesh graph: Bot prefix not available, skipping trace update")
-            return
-        
-        bot_prefix = bot_prefix.lower()
-        
-        # Check if this is a trace we sent (by matching packet hash)
-        is_our_trace = False
-        packet_hash = packet_info.get('packet_hash')
-        if packet_hash and hasattr(self.bot, 'transmission_tracker'):
-            import time
-            record = self.bot.transmission_tracker.match_packet_hash(packet_hash, time.time())
-            if record:
-                is_our_trace = True
-                self.logger.debug(f"Mesh graph: Trace packet is one we sent (matched transmission record)")
-        
-        # Check if this came back through an immediate neighbor
-        # For a trace we sent that came back, if pathHashes has exactly one node, that's our immediate neighbor
-        is_immediate_neighbor = False
-        if is_our_trace and len(path_hashes) == 1:
-            is_immediate_neighbor = True
-            self.logger.info(f"Mesh graph: Trace came back through immediate neighbor {path_hashes[0]} - trusting both directions")
-        
-        self.logger.debug(f"Mesh graph: Updating graph from trace pathHashes: {path_hashes} (bot is destination: {bot_prefix}, is_our_trace: {is_our_trace}, immediate_neighbor: {is_immediate_neighbor})")
-        
-        # Get recency window from config (default 7 days)
-        recency_days = self.bot.config.getint('Path_Command', 'graph_edge_expiration_days', fallback=7)
-        
-        # Get bot's location for distance calculations
-        from .utils import calculate_distance, _get_node_location_from_db
-        bot_location = None
-        try:
-            bot_location_result = _get_node_location_from_db(self.bot, bot_prefix, None, recency_days)
-            if bot_location_result:
-                bot_location, _ = bot_location_result
-        except Exception as e:
-            self.logger.debug(f"Could not get bot location: {e}")
-        
-        # Create edges from pathHashes to bot
-        # Since bot is the destination, the last node in pathHashes sent directly to bot
-        if len(path_hashes) > 0:
-            last_node = path_hashes[-1].lower()
-            
-            # If this is our trace that came back through an immediate neighbor, create bidirectional edge
-            if is_immediate_neighbor:
-                # We can trust both directions:
-                # 1. Bot -> Neighbor (we sent it, so we know this edge)
-                # 2. Neighbor -> Bot (we received it back, so we know this edge)
-                neighbor_prefix = path_hashes[0].lower()
-                
-                # Get neighbor's public key if unique
-                neighbor_key = None
-                try:
-                    count_query = f'''
-                        SELECT COUNT(DISTINCT public_key) as count
-                        FROM complete_contact_tracking 
-                        WHERE public_key LIKE ?
-                        AND role IN ('repeater', 'roomserver')
-                        AND COALESCE(last_advert_timestamp, last_heard) >= datetime('now', '-{recency_days} days')
-                    '''
-                    prefix_pattern = f"{neighbor_prefix}%"
-                    count_results = self.bot.db_manager.execute_query(count_query, (prefix_pattern,))
-                    
-                    if count_results and count_results[0].get('count', 0) == 1:
-                        query = f'''
-                            SELECT public_key 
-                            FROM complete_contact_tracking 
-                            WHERE public_key LIKE ?
-                            AND role IN ('repeater', 'roomserver')
-                            AND COALESCE(last_advert_timestamp, last_heard) >= datetime('now', '-{recency_days} days')
-                            ORDER BY is_starred DESC, COALESCE(last_advert_timestamp, last_heard) DESC
-                            LIMIT 1
-                        '''
-                        results = self.bot.db_manager.execute_query(query, (prefix_pattern,))
-                        if results and results[0].get('public_key'):
-                            neighbor_key = results[0]['public_key']
-                except Exception as e:
-                    self.logger.debug(f"Error checking uniqueness for immediate neighbor {neighbor_prefix}: {e}")
-                
-                # Get bot's public key (100% certain - it's us)
-                bot_key = None
-                if hasattr(self.bot.meshcore, 'device') and self.bot.meshcore.device:
-                    try:
-                        device_info = self.bot.meshcore.device
-                        if hasattr(device_info, 'public_key'):
-                            pubkey = device_info.public_key
-                            if isinstance(pubkey, str):
-                                bot_key = pubkey
-                            elif isinstance(pubkey, bytes):
-                                bot_key = pubkey.hex()
-                    except Exception as e:
-                        self.logger.debug(f"Could not get bot public key: {e}")
-                
-                # Calculate distance
-                geographic_distance = None
-                try:
-                    if bot_location:
-                        neighbor_result = _get_node_location_from_db(self.bot, neighbor_prefix, bot_location, recency_days)
-                        if neighbor_result:
-                            neighbor_location, selected_neighbor_key = neighbor_result
-                            if not neighbor_key and selected_neighbor_key:
-                                neighbor_key = selected_neighbor_key
-                            
-                            if neighbor_location and bot_location:
-                                geographic_distance = calculate_distance(
-                                    neighbor_location[0], neighbor_location[1],
-                                    bot_location[0], bot_location[1]
-                                )
-                except Exception as e:
-                    self.logger.debug(f"Could not calculate distance for immediate neighbor edge: {e}")
-                
-                # Create bidirectional edge: Bot <-> Neighbor (both directions trusted)
-                # Direction 1: Bot -> Neighbor (we sent it)
-                mesh_graph.add_edge(
-                    from_prefix=bot_prefix,
-                    to_prefix=neighbor_prefix,
-                    from_public_key=bot_key,      # 100% certain - it's the bot
-                    to_public_key=neighbor_key,  # Only if prefix was unique (certain)
-                    hop_position=1,  # First hop
-                    geographic_distance=geographic_distance
-                )
-                
-                # Direction 2: Neighbor -> Bot (we received it back)
-                mesh_graph.add_edge(
-                    from_prefix=neighbor_prefix,
-                    to_prefix=bot_prefix,
-                    from_public_key=neighbor_key,  # Only if prefix was unique (certain)
-                    to_public_key=bot_key,          # 100% certain - it's the bot
-                    hop_position=1,  # First hop (return path)
-                    geographic_distance=geographic_distance
-                )
-                
-                self.logger.info(f"Mesh graph: Created trusted bidirectional edge with immediate neighbor {neighbor_prefix}")
-                return  # Done - no need to process further for immediate neighbor case
-            
-            # Regular case: trace from elsewhere, bot is destination
-            # Create edge: last_node -> bot
-            geographic_distance = None
-            last_node_key = None
-            
-            # Check if last_node prefix is unique (for public key)
-            try:
-                count_query = f'''
-                    SELECT COUNT(DISTINCT public_key) as count
-                    FROM complete_contact_tracking 
-                    WHERE public_key LIKE ?
-                    AND role IN ('repeater', 'roomserver')
-                    AND COALESCE(last_advert_timestamp, last_heard) >= datetime('now', '-{recency_days} days')
-                '''
-                prefix_pattern = f"{last_node}%"
-                count_results = self.bot.db_manager.execute_query(count_query, (prefix_pattern,))
-                
-                if count_results and count_results[0].get('count', 0) == 1:
-                    query = f'''
-                        SELECT public_key 
-                        FROM complete_contact_tracking 
-                        WHERE public_key LIKE ?
-                        AND role IN ('repeater', 'roomserver')
-                        AND COALESCE(last_advert_timestamp, last_heard) >= datetime('now', '-{recency_days} days')
-                        ORDER BY is_starred DESC, COALESCE(last_advert_timestamp, last_heard) DESC
-                        LIMIT 1
-                    '''
-                    results = self.bot.db_manager.execute_query(query, (prefix_pattern,))
-                    if results and results[0].get('public_key'):
-                        last_node_key = results[0]['public_key']
-            except Exception as e:
-                self.logger.debug(f"Error checking uniqueness for trace last_node {last_node}: {e}")
-            
-            # Get bot's public key (100% certain - it's us)
-            bot_key = None
-            if hasattr(self.bot.meshcore, 'device') and self.bot.meshcore.device:
-                try:
-                    device_info = self.bot.meshcore.device
-                    if hasattr(device_info, 'public_key'):
-                        pubkey = device_info.public_key
-                        if isinstance(pubkey, str):
-                            bot_key = pubkey
-                        elif isinstance(pubkey, bytes):
-                            bot_key = pubkey.hex()
-                except Exception as e:
-                    self.logger.debug(f"Could not get bot public key: {e}")
-            
-            # Calculate distance if locations available
-            try:
-                if bot_location:
-                    last_node_result = _get_node_location_from_db(self.bot, last_node, bot_location, recency_days)
-                    if last_node_result:
-                        last_node_location, selected_key = last_node_result
-                        if not last_node_key and selected_key:
-                            last_node_key = selected_key
-                        
-                        if last_node_location and bot_location:
-                            geographic_distance = calculate_distance(
-                                last_node_location[0], last_node_location[1],
-                                bot_location[0], bot_location[1]
-                            )
-            except Exception as e:
-                self.logger.debug(f"Could not calculate distance for trace edge {last_node}->{bot_prefix}: {e}")
-            
-            # Add edge: last_node -> bot (100% certain - bot received the packet)
-            mesh_graph.add_edge(
-                from_prefix=last_node,
-                to_prefix=bot_prefix,
-                from_public_key=last_node_key,  # Only if prefix was unique (certain)
-                to_public_key=bot_key,          # 100% certain - it's the bot
-                hop_position=len(path_hashes),  # Position in path
-                geographic_distance=geographic_distance
-            )
-            
-            # Create edges between nodes in the pathHashes (if more than one)
-            # These represent intermediate hops
-            previous_location = bot_location
-            for i in range(len(path_hashes) - 1, 0, -1):  # Go backwards from bot
-                from_node = path_hashes[i-1].lower()
-                to_node = path_hashes[i].lower()
-                hop_position = len(path_hashes) - i  # Position from bot
-                
-                # Get public keys if unique
-                from_node_key = None
-                to_node_key = None
-                
-                # Check uniqueness for both nodes
-                for node, key_var in [(from_node, 'from_node_key'), (to_node, 'to_node_key')]:
-                    try:
-                        count_query = f'''
-                            SELECT COUNT(DISTINCT public_key) as count
-                            FROM complete_contact_tracking 
-                            WHERE public_key LIKE ?
-                            AND role IN ('repeater', 'roomserver')
-                            AND COALESCE(last_advert_timestamp, last_heard) >= datetime('now', '-{recency_days} days')
-                        '''
-                        prefix_pattern = f"{node}%"
-                        count_results = self.bot.db_manager.execute_query(count_query, (prefix_pattern,))
-                        
-                        if count_results and count_results[0].get('count', 0) == 1:
-                            query = f'''
-                                SELECT public_key 
-                                FROM complete_contact_tracking 
-                                WHERE public_key LIKE ?
-                                AND role IN ('repeater', 'roomserver')
-                                AND COALESCE(last_advert_timestamp, last_heard) >= datetime('now', '-{recency_days} days')
-                                ORDER BY is_starred DESC, COALESCE(last_advert_timestamp, last_heard) DESC
-                                LIMIT 1
-                            '''
-                            results = self.bot.db_manager.execute_query(query, (prefix_pattern,))
-                            if results and results[0].get('public_key'):
-                                if key_var == 'from_node_key':
-                                    from_node_key = results[0]['public_key']
-                                else:
-                                    to_node_key = results[0]['public_key']
-                    except Exception as e:
-                        self.logger.debug(f"Error checking uniqueness for trace node {node}: {e}")
-                
-                # Calculate distance
-                geographic_distance = None
-                try:
-                    if previous_location:
-                        from_result = _get_node_location_from_db(self.bot, from_node, previous_location, recency_days)
-                        if from_result:
-                            from_location, selected_from_key = from_result
-                            if not from_node_key and selected_from_key:
-                                from_node_key = selected_from_key
-                            
-                            to_result = _get_node_location_from_db(self.bot, to_node, from_location, recency_days)
-                            if to_result:
-                                to_location, selected_to_key = to_result
-                                if not to_node_key and selected_to_key:
-                                    to_node_key = selected_to_key
-                                
-                                if from_location and to_location:
-                                    geographic_distance = calculate_distance(
-                                        from_location[0], from_location[1],
-                                        to_location[0], to_location[1]
-                                    )
-                                    previous_location = from_location
-                except Exception as e:
-                    self.logger.debug(f"Could not calculate distance for trace edge {from_node}->{to_node}: {e}")
-                
-                # Add edge between path nodes
-                mesh_graph.add_edge(
-                    from_prefix=from_node,
-                    to_prefix=to_node,
-                    from_public_key=from_node_key,  # Only if prefix was unique (certain)
-                    to_public_key=to_node_key,      # Only if prefix was unique (certain)
-                    hop_position=hop_position,
-                    geographic_distance=geographic_distance
-                )
+        """Update mesh graph with edges from a trace packet's pathHashes. Delegates to shared helper."""
+        update_mesh_graph_from_trace_data(self.bot, path_hashes, packet_info)
     
     async def discover_message_path(self, sender_id: str, rf_data: dict) -> tuple[int, str]:
         """
@@ -2656,8 +2441,13 @@ class MessageHandler:
                         self.logger.debug(f"Direct connection to {sender_id}")
                         return 0, "Direct"
                     elif out_path_len > 0:
-                        # Format the path string with two-character node prefixes
-                        path_string = self._format_path_string(out_path)
+                        # Format the path string (use stored bytes_per_hop for multi-byte paths)
+                        bph = contact.get('out_bytes_per_hop')
+                        if bph is None and out_path_len > 0 and out_path:
+                            byte_len = len(out_path) // 2
+                            if byte_len > 0 and (byte_len % out_path_len) == 0:
+                                bph = byte_len // out_path_len
+                        path_string = self._format_path_string(out_path, bytes_per_hop=bph)
                         self.logger.debug(f"Stored path to {sender_id}: {out_path_len} hops via {path_string}")
                         return out_path_len, path_string
                     else:
@@ -2721,7 +2511,12 @@ class MessageHandler:
                     if out_path_len == 0:
                         self.logger.info(f"📡 {sender_id} → Direct connection")
                     elif out_path_len > 0:
-                        path_string = self._format_path_string(out_path)
+                        bph = contact.get('out_bytes_per_hop')
+                        if bph is None and out_path_len > 0 and out_path:
+                            byte_len = len(out_path) // 2
+                            if byte_len > 0 and (byte_len % out_path_len) == 0:
+                                bph = byte_len // out_path_len
+                        path_string = self._format_path_string(out_path, bytes_per_hop=bph)
                         self.logger.info(f"📡 {sender_id} → {path_string} ({out_path_len} hops)")
                     else:
                         self.logger.info(f"📡 {sender_id} → Path not set")
@@ -2767,26 +2562,34 @@ class MessageHandler:
         except Exception as e:
             self.logger.error(f"Error in debug packet decoding: {e}")
     
-    def _format_path_string(self, hex_path: str) -> str:
+    def _format_path_string(self, hex_path: str, bytes_per_hop: Optional[int] = None) -> str:
         """
-        Convert a hex path string to the two-character node prefix format.
+        Convert a hex path string to node prefix format.
         
         Args:
-            hex_path: Hex string representing the path (e.g., "01025f7e")
+            hex_path: Hex string representing the path (e.g., "01025f7e" or "01025fab" for 2-byte hops).
+            bytes_per_hop: Optional bytes per hop (1, 2, or 3) for multi-byte paths; None = legacy 1 byte per node.
             
         Returns:
-            str: Formatted path string (e.g., "01,02,5f,7e")
+            str: Formatted path string (e.g., "01,02,5f,7e" or "0102,5fab")
         """
         try:
             if not hex_path:
                 return "Direct"
             
-            # Convert hex to bytes and extract one-byte chunks for two-character format
+            if bytes_per_hop is not None and bytes_per_hop > 0:
+                hex_chars = bytes_per_hop * 2
+                path_nodes = [hex_path[i:i + hex_chars].lower() for i in range(0, len(hex_path), hex_chars)]
+                if (len(hex_path) % hex_chars) != 0 or not path_nodes:
+                    path_nodes = [hex_path[i:i + 2].lower() for i in range(0, len(hex_path), 2)]
+                if path_nodes:
+                    return ",".join(path_nodes)
+                return "Direct"
+            
+            # Legacy: one byte per node (two hex chars)
             path_bytes = bytes.fromhex(hex_path)
             path_nodes = []
-            
             for i in range(len(path_bytes)):
-                # Extract each byte and convert to two-character hex
                 node_id = path_bytes[i]
                 path_nodes.append(f"{node_id:02x}")
             
@@ -2928,13 +2731,43 @@ class MessageHandler:
                         )
                     except Exception as e:
                         self.logger.debug(f"Failed to capture keyword data for web viewer: {e}")
-        
+
         # Only execute commands if no help response was sent and no plugin command with response was matched
         # Help responses and plugin commands with responses should be the final response for that message
         # Plugin commands without responses (response is None) should still be executed
         if not help_response_sent and not plugin_command_with_response_matched:
-            await self.bot.command_manager.execute_commands(message)
-    
+            # After keyword handling, try RandomLine            
+            randomline_match = self.bot.command_manager.match_randomline(message)
+            if randomline_match:
+                key, response = randomline_match
+                plugin_command_with_response_matched = True
+                import time
+                command_id = f"randomline_{key}_{message.sender_id}_{int(time.time())}"
+
+                try:
+                    rate_limit_key = self.bot.command_manager.get_rate_limit_key(message)
+                    if message.is_dm:
+                        success = await self.bot.command_manager.send_dm(
+                            message.sender_id, response, command_id, rate_limit_key=rate_limit_key
+                        )
+                    else:
+                        success = await self.bot.command_manager.send_channel_message(
+                            message.channel, response, command_id, rate_limit_key=rate_limit_key
+                        )
+
+                    if not success:
+                        self.logger.warning(
+                            f"Failed to send randomline response for '{key}' to "
+                            f"{message.sender_id if message.is_dm else message.channel}"
+                        )
+                except Exception as e:
+                    self.logger.error(f"Error sending randomline response for '{key}': {e}", exc_info=True)
+                    success = False
+                
+            else:
+                # If no keyword or RandomLine match, try all other commands
+                await self.bot.command_manager.execute_commands(message)
+            
     def should_process_message(self, message: MeshMessage) -> bool:
         """Check if message should be processed by the bot"""
         # Check if bot is enabled
@@ -3025,6 +2858,7 @@ class MessageHandler:
                                 if path_hex and path_length > 0:
                                     contact_data['out_path'] = path_hex
                                     contact_data['out_path_len'] = path_length
+                                    contact_data['out_bytes_per_hop'] = routing_info.get('bytes_per_hop', 1)
                                 elif path_length == 0:
                                     contact_data['out_path'] = ''
                                     contact_data['out_path_len'] = 0
@@ -3035,12 +2869,14 @@ class MessageHandler:
                                 try:
                                     packet_info = {
                                         'routing_info': routing_info,
-                                        'packet_hash': packet_hash
+                                        'packet_hash': packet_hash,
+                                        'bytes_per_hop': routing_info.get('bytes_per_hop', 1)
                                     }
-                                    self._update_mesh_graph_from_advert(contact_data, path_hex, path_length, packet_info)
+                                    path_byte_len = routing_info.get('path_byte_length') or (len(path_hex) // 2)
+                                    self._update_mesh_graph_from_advert(contact_data, path_hex, path_byte_len, packet_info)
                                     self.logger.debug(f"Mesh graph: Updated from NEW_CONTACT event for {contact_name} (key: {public_key[:16]}...)")
                                     # Store complete path in observed_paths table
-                                    self._store_observed_path(contact_data, path_hex, path_length, 'advert', packet_hash=packet_hash)
+                                    self._store_observed_path(contact_data, path_hex, path_byte_len, 'advert', packet_hash=packet_hash, bytes_per_hop=routing_info.get('bytes_per_hop', 1))
                                 except Exception as e:
                                     self.logger.debug(f"Error updating mesh graph from NEW_CONTACT: {e}")
                             
@@ -3085,7 +2921,7 @@ class MessageHandler:
                         try:
                             node_data = {
                                 'public_key': public_key,
-                                'prefix': public_key[:2].lower() if public_key else '',
+                                'prefix': public_key[:self.bot.prefix_hex_chars].lower() if public_key else '',
                                 'name': contact_name,
                                 'role': 'repeater'
                             }

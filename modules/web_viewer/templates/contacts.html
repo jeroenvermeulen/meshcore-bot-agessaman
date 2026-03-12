@@ -982,10 +982,12 @@ class ModernContactsManager {
             // Create a unique ID for this tooltip
             const tooltipId = `hops-tooltip-${contact.user_id.substring(0, 16).replace(/[^a-zA-Z0-9]/g, '_')}`;
             const pathCountText = hasMultiplePaths ? ` <small>(${allPaths.length} paths)</small>` : '';
+            const bytesPerHop = contact.out_bytes_per_hop != null && [1, 2, 3].includes(Number(contact.out_bytes_per_hop)) ? Number(contact.out_bytes_per_hop) : '';
             return `<span class="badge bg-primary path-badge" 
                           id="${tooltipId}" 
                           data-path-hex="${escapedPath}"
                           data-path-len="${outPathLen}"
+                          data-bytes-per-hop="${bytesPerHop}"
                           data-user-id="${escapedUserId}"
                           onclick="contactsManager.showPathsModal('${escapedUserId}')"
                           style="cursor: pointer; position: relative;" 
@@ -1073,16 +1075,18 @@ class ModernContactsManager {
                     
                     try {
                         badge.dataset.loading = 'true';
-                        
+                        const body = { path_hex: pathHex };
+                        const bytesPerHop = badge.dataset.bytesPerHop;
+                        if (bytesPerHop && ['1', '2', '3'].includes(bytesPerHop)) {
+                            body.bytes_per_hop = parseInt(bytesPerHop, 10);
+                        }
                         // Fetch decoded path from API
                         const response = await fetch('/api/decode-path', {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json'
                             },
-                            body: JSON.stringify({
-                                path_hex: pathHex
-                            })
+                            body: JSON.stringify(body)
                         });
                         
                         const data = await response.json();
@@ -1139,11 +1143,15 @@ class ModernContactsManager {
         });
     }
     
-    formatPathHex(pathHex) {
-        // Break hex string into two-character chunks with spaces for readability
+    formatPathHex(pathHex, bytesPerHop) {
+        // Break hex string into chunks for readability. bytesPerHop 1,2,3 → 2,4,6 hex chars per node.
         if (!pathHex) return '';
-        // Match every 1-2 characters (handles odd-length strings gracefully)
-        return pathHex.match(/.{1,2}/g)?.join(' ') || pathHex;
+        const n = (bytesPerHop && [1, 2, 3].includes(Number(bytesPerHop))) ? (Number(bytesPerHop) * 2) : 2;
+        const chunks = [];
+        for (let i = 0; i < pathHex.length; i += n) {
+            chunks.push(pathHex.slice(i, i + n));
+        }
+        return chunks.join(' ') || pathHex;
     }
     
     sortPaths(paths, sortOrder) {
@@ -1197,20 +1205,23 @@ class ModernContactsManager {
             const path = paths[i];
             const isPrimary = path.path_hex === primaryPath;
             const primaryBadge = isPrimary ? '<span class="badge bg-success ms-2">Primary</span>' : '';
-            const formattedPathHex = this.formatPathHex(path.path_hex);
+            const bph = path.bytes_per_hop != null && [1, 2, 3].includes(Number(path.bytes_per_hop)) ? Number(path.bytes_per_hop) : null;
+            const formattedPathHex = this.formatPathHex(path.path_hex, bph);
+            const hopLabel = bph && path.path_length > 0 ? `${Math.floor(path.path_length / bph)} hops, ` : '';
+            const bytesPerHopAttr = bph != null ? ` data-path-bph="${bph}"` : '';
             
             pathsHtml += `
-                <div class="list-group-item path-list-item ${isPrimary ? 'border-success' : ''}" id="path-item-${i}">
+                <div class="list-group-item path-list-item ${isPrimary ? 'border-success' : ''}" id="path-item-${i}"${bytesPerHopAttr}>
                     <div class="d-flex justify-content-between align-items-start">
                         <div class="flex-grow-1">
                             <h6 class="mb-1">
                                 Path ${i + 1} ${primaryBadge}
-                                <small class="text-muted">(${path.path_length} bytes, ${path.observation_count} observations)</small>
+                                <small class="text-muted">(${hopLabel}${path.path_length} bytes, ${path.observation_count} observations)</small>
                             </h6>
                             <p class="mb-1"><code class="path-hex-code">${this.escapeHtml(formattedPathHex)}</code></p>
                             <small class="text-muted">Last seen: ${this.formatTimeAgo(path.last_seen)}</small>
                         </div>
-                        <button class="btn btn-sm btn-outline-primary" onclick="contactsManager.decodePathInModal('${path.path_hex}', ${i})">
+                        <button class="btn btn-sm btn-outline-primary" onclick="contactsManager.decodePathInModal('${String(path.path_hex).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}', ${i}, ${bph != null ? bph : 'null'})">
                             <i class="fas fa-code"></i> Decode
                         </button>
                     </div>
@@ -1321,28 +1332,35 @@ class ModernContactsManager {
         });
     }
     
-    async decodePathInModal(pathHex, pathIndex) {
+    async decodePathInModal(pathHex, pathIndex, pathBytesPerHop) {
         const decodedDiv = document.getElementById(`decoded-path-${pathIndex}`);
-        const button = document.querySelector(`#path-item-${pathIndex} button`);
-        
+        const pathItem = document.getElementById(`path-item-${pathIndex}`);
+        const button = pathItem ? pathItem.querySelector('button') : null;
+
         if (!decodedDiv || !button) return;
-        
+
         // Show loading state
         const originalHtml = button.innerHTML;
         button.disabled = true;
         button.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Decoding...';
         decodedDiv.style.display = 'block';
         decodedDiv.innerHTML = '<div class="text-muted"><i class="fas fa-spinner fa-spin"></i> Decoding path...</div>';
-        
+
         try {
+            // Prefer this path's bytes_per_hop; fall back to contact's out_bytes_per_hop
+            const bytesPerHop = (pathBytesPerHop != null && [1, 2, 3].includes(Number(pathBytesPerHop)))
+                ? Number(pathBytesPerHop)
+                : (this.currentModalContact?.out_bytes_per_hop != null && [1, 2, 3].includes(Number(this.currentModalContact.out_bytes_per_hop)) ? Number(this.currentModalContact.out_bytes_per_hop) : null);
+            const body = { path_hex: pathHex };
+            if (bytesPerHop != null) {
+                body.bytes_per_hop = bytesPerHop;
+            }
             const response = await fetch('/api/decode-path', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({
-                    path_hex: pathHex
-                })
+                body: JSON.stringify(body)
             });
             
             const data = await response.json();

@@ -5,6 +5,7 @@ Tests that all commands properly handle command prefixes when enabled
 """
 
 import pytest
+from pathlib import Path
 from unittest.mock import Mock, MagicMock, patch
 from configparser import ConfigParser
 
@@ -49,6 +50,8 @@ def mock_bot():
     bot.bot_tx_rate_limiter = Mock()
     bot.bot_tx_rate_limiter.wait_for_tx = Mock()
     bot.tx_delay_ms = 0
+    bot.bot_root = Path("/tmp")
+    bot._local_root = None  # CommandManager uses bot_root / local / commands
     return bot
 
 

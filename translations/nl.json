@@ -286,7 +286,8 @@
             },
             "paths": {
                 "none": "Geen routedata",
-                "format": "{rank} {sender} {path}"
+                "format": "{rank} {sender} {path}",
+                "synopsis": "{rank} {sender}: {hops} hops"
             }
         },
         "solarforecast": {

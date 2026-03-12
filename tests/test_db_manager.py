@@ -2,6 +2,7 @@
 
 import sqlite3
 import json
+from contextlib import closing
 
 import pytest
 from unittest.mock import Mock
@@ -72,7 +73,7 @@ class TestGenericCache:
 
     def test_get_cached_json_invalid_json(self, db):
         """Manually insert invalid JSON; get_cached_json returns None."""
-        with sqlite3.connect(str(db.db_path)) as conn:
+        with closing(sqlite3.connect(str(db.db_path))) as conn:
             conn.execute(
                 "INSERT INTO generic_cache (cache_key, cache_value, cache_type, expires_at) "
                 "VALUES (?, ?, ?, datetime('now', '+24 hours'))",
@@ -88,7 +89,7 @@ class TestCacheCleanup:
     def test_cleanup_expired_deletes_old(self, db):
         db.cache_value("old_key", "old_val", "test")
         # Manually set expires_at to the past
-        with sqlite3.connect(str(db.db_path)) as conn:
+        with closing(sqlite3.connect(str(db.db_path))) as conn:
             conn.execute(
                 "UPDATE generic_cache SET expires_at = datetime('now', '-1 hours') "
                 "WHERE cache_key = 'old_key'"
@@ -111,7 +112,7 @@ class TestTableManagement:
             "greeted_users",
             "id INTEGER PRIMARY KEY, name TEXT NOT NULL",
         )
-        with sqlite3.connect(str(db.db_path)) as conn:
+        with closing(sqlite3.connect(str(db.db_path))) as conn:
             cursor = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='greeted_users'"
             )
